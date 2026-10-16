@@ -1,0 +1,19 @@
+# rag-mcp-server 依赖（版本为实测通过验证的固定版本，2026-10-16 / Python 3.12.9 / Windows）
+
+# MCP 官方 Python SDK（2.x：FastMCP 已更名为 MCPServer，见 README「协议版本说明」）
+mcp==2.3.0
+
+# Embedding：BGE-small-zh-v1.5（512 维，中文）
+sentence-transformers==5.7.0
+transformers==5.20.0
+# 说明：PyPI 上的 Windows 版 torch 为 CPU 版（约 124MB）。
+# 需要 GPU 加速时请按官方指引安装对应 CUDA 版本，例如：
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+torch==2.14.1
+
+# 数值与配置
+numpy==2.5.4
+PyYAML==6.0.3
+
+# 测试（可选）
+pytest==9.1.1

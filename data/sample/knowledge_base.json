@@ -1,0 +1,22 @@
+[
+  {
+    "text": "人工智能（Artificial Intelligence，简称AI）是计算机科学的一个分支，旨在创建能够模拟人类智能行为的系统。\n\n机器学习是人工智能的核心方法，通过从数据中学习模式来完成特定任务。深度学习是机器学习的一个子领域，使用多层神经网络来学习数据的层次化表示。\n\n自然语言处理（NLP）是AI的重要应用领域，涉及文本理解、机器翻译、情感分析、问答系统等任务。近年来，基于Transformer架构的大语言模型（如GPT、BERT、Qwen等）在NLP领域取得了突破性进展。\n\n检索增强生成（RAG）是一种结合信息检索和文本生成的技术，通过从外部知识库中检索相关文档来增强大语言模型的回答质量，减少幻觉问题。",
+    "source": "ai_intro.txt"
+  },
+  {
+    "text": "Transformer架构由Vaswani等人在2017年提出，核心组件包括：\n\n1. 自注意力机制（Self-Attention）：让每个token能够关注序列中的所有其他token，计算公式为 Attention(Q,K,V) = softmax(QK^T/√d_k)V。除以√d_k是为了防止点积方差随维度增长，导致softmax梯度消失。\n\n2. 多头注意力（Multi-Head Attention）：使用多组不同的QKV投影，让模型从不同的表示子空间学习信息。\n\n3. 位置编码（Positional Encoding）：由于注意力机制本身对位置不敏感，需要额外注入位置信息。原始Transformer使用正余弦编码，现代架构（LLaMA、Qwen）使用旋转位置编码（RoPE）。\n\n4. 前馈网络（Feed-Forward Network）：每个位置独立应用的两层全连接网络，通常使用ReLU或SwiGLU激活函数。\n\n5. 残差连接与层归一化：残差连接绕过子层直接传递信号，层归一化稳定训练过程。",
+    "source": "transformer.txt"
+  },
+  {
+    "text": "大语言模型的微调技术主要包括：\n\n1. 全参数微调（Full Fine-Tuning）：更新所有模型参数，效果最好但计算成本高。微调7B模型FP16需要约76GB显存，通常需要多张A100显卡。\n\n2. 参数高效微调（PEFT）：只训练少量新增参数，冻结原始模型。典型方法包括：\n   - LoRA（Low-Rank Adaptation）：在权重矩阵旁添加低秩分解矩阵A和B（h = Wx + (α/r)BAx），只训练A和B。典型配置r=8，α=16，可训练参数仅占总量的0.3%左右。\n   - QLoRA：在LoRA基础上加入4bit量化，进一步降低显存需求。\n   - Adapter：在Transformer层之间插入小型的可训练瓶颈层。\n\n3. 指令微调（Instruction Tuning）：使用指令-回答对训练模型遵循人类指令的能力。\n\n4. RLHF（基于人类反馈的强化学习）：先用人类偏好训练奖励模型，再用PPO算法优化策略。DPO（直接偏好优化）跳过奖励模型步骤，直接从偏好数据中优化。",
+    "source": "finetuning.txt"
+  },
+  {
+    "text": "模型量化是将浮点模型参数转换为低位整数表示的技术，目的是减少模型大小和推理延迟。\n\n常见量化方法：\n- INT8量化：FP32→INT8，显存减少75%，精度损失极小\n- INT4量化：FP16→INT4，显存减少75%，需要分组量化或NF4等技术保持精度\n\nNF4（NormalFloat4）是一种针对正态分布权重优化的4位量化格式，由QLoRA提出。与均匀量化不同，NF4的16个值在权重密集区域分布更密，在边角分布更疏——因为在正态分布中，绝大多数权重集中在均值附近。\n\n量化计算：scale = (max - min) / 15，quantized = round((value - min) / scale)。推理时反量化：value ≈ quantized × scale + min，误差通常<1%。",
+    "source": "quantization.txt"
+  },
+  {
+    "text": "检索增强生成（RAG）系统的核心组件和优化策略：\n\n1. 文档处理：将原始文档切分为适当大小的chunk。chunk_size的选择是精度-效率的权衡——太小导致语义不完整，太大导致检索精度下降。典型值256-1024字符。重叠（overlap）防止关键信息被切断在边界。\n\n2. Embedding模型：将文本转换为向量表示。中文场景推荐BGE、m3e、stella等模型。向量需归一化以使点积等价于余弦相似度。\n\n3. 向量检索：使用余弦相似度衡量query和文档的相关性。大规模场景用Faiss的IVF+PQ索引替代暴力搜索，精度损失1-3%但速度快两个数量级。\n\n4. 生成优化：Prompt设计至关重要——明确指示模型\"只使用参考文档\"、\"不知道就说不知道\"。temperature设为0.3以保持回答的一致性。\n\n5. 延迟优化：embedding缓存（文档不变不重算）、流式输出（首token即返回）、模型量化（INT4从6GB压到1.5GB）。",
+    "source": "rag_guide.txt"
+  }
+]

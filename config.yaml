@@ -1,0 +1,31 @@
+# rag-mcp-server 配置文件
+# 说明：所有相对路径都按「本文件所在目录」解析，因此进程的工作目录不影响行为。
+
+knowledge_base:
+  # 支持：单个 .json（[{"text": ..., "source": ...}, ...]）/ 目录（.txt/.md/.json）/ 单个 .txt
+  path: "./data/sample/knowledge_base.json"
+  # 也可以直接指向同源平台的数据文件（格式一致，无需改动代码）：
+  # path: "../rag-eval-platform/data/sample/knowledge_base.json"
+
+chunking:
+  strategy: "fixed_size"   # 本仓库只移植了固定窗口切分（原平台另有 recursive / semantic）
+  chunk_size: 512          # 字符数：一个 chunk 覆盖一段完整技术要点
+  chunk_overlap: 50        # 重叠字符数：防止关键句被切在窗口边界上
+
+embedding:
+  model_name: "BAAI/bge-small-zh-v1.5"   # 中文小模型，512 维
+  device: "auto"           # auto（有 GPU 用 GPU，否则 CPU）| cpu | cuda
+  batch_size: 64
+  cache_dir: "./data/embedding_cache"    # 文本 MD5 缓存：内容不变不重算
+  offline: true            # 模型已在本机缓存 → 禁止联网，完全离线可复现
+
+retrieval:
+  top_k: 3                 # 默认返回条数
+  similarity_threshold: 0.3  # 余弦相似度低于此值的内容不返回（宁可不答，不喂噪音）
+  max_top_k: 10            # top_k 硬上限：约束单次调用注入模型上下文的最大长度
+
+server:
+  name: "rag-mcp-server"
+  version: "0.1.0"
+  warmup: true             # 启动时预热索引（把首调用延迟挪到启动阶段）
+  log_level: "INFO"        # 日志走 stderr，不污染 stdio 协议通道
