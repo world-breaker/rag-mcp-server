@@ -15,5 +15,8 @@ torch==2.14.1
 numpy==2.5.4
 PyYAML==6.0.3
 
+# HTTP 传输（streamable-http / sse）：MCP SDK 的 HTTP 传输在运行时会 import uvicorn
+uvicorn>=0.30
+
 # 测试（可选）
 pytest==9.1.1

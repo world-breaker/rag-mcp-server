@@ -165,6 +165,86 @@ pip install -r requirements.txt
 > ⚠️ 别用 `print` 调试 Server：stdio 模式下 **stdout 是协议通道**，
 > 一行 `print` 会让客户端解析报文失败。本项目的日志统一走 **stderr**（见 `rag/logging_utils.py`）。
 
+### 5.5 三种传输方式（stdio / Streamable HTTP / SSE）
+
+**业务检索代码完全不变，只换传输层**——这是「协议层与核心逻辑解耦」的直接收益：
+`KnowledgeService` 不感知 MCP，`server.py` 只负责把工具挂到不同 transport 上。
+
+| 传输 | 适用场景 | 端点 | 默认 |
+|------|----------|------|------|
+| `stdio` | 本地客户端拉起子进程（Claude Desktop / Cursor） | stdin/stdout | ✅ |
+| `streamable-http` | 远程部署、多客户端共享、Web 前端、容器 | `http://host:port/mcp` | 推荐 HTTP |
+| `sse` | 旧版 HTTP 客户端兼容 | `/sse` + `/messages/` | 保留 |
+
+启动方式（优先级：**命令行 > 环境变量 > config.yaml > 代码默认值**）：
+
+```bash
+# 1) stdio（默认，行为与之前完全一致）
+.venv\Scripts\python.exe server.py
+
+# 2) Streamable HTTP（推荐远程）
+.venv\Scripts\python.exe server.py --transport streamable-http --host 127.0.0.1 --port 8000
+#    端点：http://127.0.0.1:8000/mcp
+
+# 3) 旧版 SSE
+.venv\Scripts\python.exe server.py --transport sse --port 8000
+#    端点：http://127.0.0.1:8000/sse
+
+# 4) 环境变量方式（容器 / CI 常用，无需改配置文件）
+RAG_MCP_TRANSPORT=streamable-http RAG_MCP_HOST=0.0.0.0 RAG_MCP_PORT=8000 \
+  .venv\Scripts\python.exe server.py
+```
+
+可选参数：
+
+- `--stateless`：无状态模式，不保存会话（多实例 / 负载均衡部署时开启）；
+- `--json-response`：Streamable HTTP 返回普通 JSON 而非 SSE 流（便于 curl / httpx 调试）；
+- `--path`：自定义 HTTP 路径（默认 `/mcp` 或 `/sse`）。
+
+HTTP 客户端接入（Cursor / 支持远程 MCP 的客户端）：
+
+```json
+{
+  "mcpServers": {
+    "rag-knowledge": {
+      "url": "http://127.0.0.1:8000/mcp"
+    }
+  }
+}
+```
+
+> 不同客户端版本的字段名可能略有差异（`url` / `type` / `transport`），以客户端文档为准；
+> stdio 的配置方式见下一节，两种方式可同时存在。
+
+**验证 HTTP 链路**（先启动 server，再另开终端）：
+
+```bash
+.venv\Scripts\python.exe scripts\mcp_http_client_demo.py --port 8000
+# 或：--transport sse --port 8000 / --url http://127.0.0.1:8000/mcp
+```
+
+该脚本走与 stdio 版相同的完整协议：`initialize → tools/list → tools/call`，
+只是底层从 stdin/stdout 换成了 HTTP。
+
+**安全与部署注意**：
+
+- 默认只绑定 `127.0.0.1`，本机可用；对外提供服务改 `--host 0.0.0.0`，
+  但**必须**配合鉴权（MCP 的 OAuth `auth_server_provider` / `token_verifier`）或反向代理，
+  不要把无鉴权的检索服务直接暴露到公网。
+- SDK 对 `127.0.0.1 / localhost / ::1` 自动开启 DNS rebinding 防护（校验 Host / Origin）；
+  绑定 `0.0.0.0` 或用域名访问时，建议在 `config.yaml` 显式配置：
+  ```yaml
+  server:
+    allowed_hosts: ["127.0.0.1:*", "rag.example.com"]
+    allowed_origins: ["http://localhost:*", "https://rag.example.com"]
+  ```
+  否则可能被 Host/Origin 校验拒绝（HTTP 421）。
+- 生产环境建议加 `--stateless` 做水平扩展（会话不落在单实例内存里）。
+
+**本机实测（2026-10-18）**：`streamable-http` 端到端通过——`initialize` → `tools/list`（2 个工具）→
+`search_knowledge`（LoRA / RAG 命中，领域外问题被阈值过滤）→ `knowledge_base_stats`；
+全量测试 **14 passed**（原 6 + 新增 8），stdlib 行为零回归。
+
 ---
 
 ## 6. 接入 Claude Desktop / Cursor
@@ -370,6 +450,8 @@ tests/test_service.py::test_result_is_json_serializable PASSED           [100%]
 |---|---|---|
 | **日志一律走 stderr** | stdio 模式下 stdout 是 JSON-RPC 通道 | 一行 `print` 就破坏协议，客户端报解析错误 |
 | **检索与协议分层**（`service` / `server.py`） | 换传输协议（stdio→HTTP）不用动检索代码；测检索不需要起协议 | 逻辑和协议耦在一起，只能靠端到端调试 |
+| **一套代码支持 stdio / streamable-http / sse** | 本地宿主用 stdio、远程/多客户端用 HTTP；只换传输层，工具定义与检索逻辑零改动 | 想做远程服务就得复制一份 HTTP 版，两套代码逐渐漂移 |
+| **HTTP 默认只绑 127.0.0.1** | 默认安全；对外暴露必须显式改 host 并自行加鉴权/代理 | 一条命令就把无鉴权检索服务暴露到公网 |
 | **索引懒加载 + 启动预热** | 把 5s 的模型加载挪到启动阶段，避免首次工具调用撞客户端超时 | 第一次调用延迟过大，宿主可能判定超时 |
 | **`top_k` 硬上限 `max_top_k`** | 工具返回值会直接进模型上下文；不设上限等于把「上下文成本」交给模型乱填 | 一次调用塞进几万 token，成本和延迟失控 |
 | **相似度阈值过滤 + `filtered_by_threshold`** | 「检索不到」和「检索到但不相关」是两种不同状态，必须能区分 | 上层无法判断该换问法还是该放弃（对应 Agent 的失败分类） |
@@ -395,11 +477,11 @@ tests/test_service.py::test_result_is_json_serializable PASSED           [100%]
 
 ```text
 rag-mcp-server/
-├── server.py                  # MCP Server 入口（stdio）：工具定义 + 预热 + 日志纪律
-├── config.yaml                # 知识库路径 / 切分 / embedding / 检索 / server 配置
+├── server.py                  # MCP Server 入口（stdio / streamable-http / sse）：工具定义 + 预热 + 日志纪律
+├── config.yaml                # 知识库路径 / 切分 / embedding / 检索 / 传输（host/port/path）
 ├── requirements.txt           # 固定版本依赖（实测通过）
 ├── rag/
-│   ├── config.py              # 配置加载：默认值合并 + 相对路径解析 + device 自动探测
+│   ├── config.py              # 配置加载：默认值合并 + 相对路径解析 + 环境变量覆盖 + device 自动探测
 │   ├── logging_utils.py       # 日志统一写 stderr（保住 stdout 给协议）
 │   ├── chunking.py            # 固定窗口切分（最小移植）
 │   ├── embedding.py           # BGE-small-zh-v1.5 + 文本 MD5 缓存 + 离线开关
@@ -407,9 +489,11 @@ rag-mcp-server/
 │   └── service.py             # KnowledgeService：加载 → 建索引 → 检索（进程级单例）
 ├── scripts/
 │   ├── smoke_test.py          # 冒烟：不经协议，直接验证检索链路（含领域外问题探针）
-│   └── mcp_client_demo.py     # 端到端：官方 MCP 客户端 stdio 调用（含 tools/list）
+│   ├── mcp_client_demo.py     # 端到端：官方 MCP 客户端 stdio 调用（含 tools/list）
+│   └── mcp_http_client_demo.py# 端到端：连接已运行的 HTTP Server（streamable-http / sse）
 ├── tests/
-│   └── test_service.py        # 6 个行为契约测试
+│   ├── test_service.py        # 6 个检索行为契约测试
+│   └── test_http_transport.py # 8 个传输测试（参数映射 + Streamable HTTP 端到端）
 └── data/sample/
     └── knowledge_base.json    # 示例知识库（5 篇中文技术短文，与 rag-eval-platform 同源同文件）
 ```
@@ -418,14 +502,18 @@ rag-mcp-server/
 
 ## 11. 已知边界（如实说明）
 
-- **知识库规模**：样例 5 篇文档 / 5 个 chunk。更大规模（万级 chunk）应换 Faiss / 向量库，
-  并考虑 BM25+向量的混合检索与重排（Rerank）——本项目**没有**实现这些。
-- **检索质量**：没有做重排、没有做查询改写（HyDE / multi-query）、没有 chunk 级评测集，
+- **知识库规模**：样例 5 篇文档 / 5 个 chunk。更大规模（万级 chunk）应换 Faiss / 向量库。
+  本服务本身只做纯向量检索；**BM25+向量混合检索与重排已在
+  [rag-eval-platform](../rag-eval-platform) 侧实现并做了对照实验**，但尚未移植到这里。
+- **检索质量**：本服务没有做重排、没有做查询改写（HyDE / multi-query）、没有 chunk 级评测集，
   因此**无法给出 Recall@K 之类的正式指标**；本项目只对「行为契约」做了测试。
   检索效果的正式评测在 [rag-eval-platform](../rag-eval-platform) 侧（三层指标 + 真实实验数据）。
 - **切分策略**：只移植了固定窗口切分；原平台的 recursive / semantic 未移植。
-- **传输模式**：只实现 stdio；HTTP（streamable-http / SSE）没实现（多用户场景才需要）。
-- **鉴权**：stdio 是本机子进程模式，无鉴权；做成网络服务时必须另行加鉴权与限流。
+- **传输模式**：已支持 `stdio` / `streamable-http` / `sse` 三种；本地已端到端验证，
+  但**未做压测、未验证反向代理/多实例会话粘滞**等生产级场景。
+- **鉴权**：stdio 是本机子进程模式，无鉴权；HTTP 模式默认只绑 `127.0.0.1`。
+  对外提供服务时必须另行加鉴权（MCP OAuth / token verifier）与限流，
+  **不要**把无鉴权的检索服务直接暴露到公网。
 
 ## License
 

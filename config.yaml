@@ -29,3 +29,21 @@ server:
   version: "0.1.0"
   warmup: true             # 启动时预热索引（把首调用延迟挪到启动阶段）
   log_level: "INFO"        # 日志走 stderr，不污染 stdio 协议通道
+
+  # ===== 传输方式：stdio | streamable-http | sse =====
+  # stdio：默认。由 MCP 客户端拉起子进程，Claude Desktop / Cursor 本地接入。
+  # streamable-http：推荐远程/多客户端，端点 /mcp，支持会话与流式。
+  # sse：旧版 HTTP 传输（/sse + /messages/），仅为兼容旧客户端保留。
+  # 提示：命令行 --transport/--host/--port 优先级高于本文件；环境变量 RAG_MCP_TRANSPORT/HOST/PORT 次之。
+  transport: "stdio"
+  host: "127.0.0.1"        # 对外提供服务时改 "0.0.0.0"（务必配合鉴权/反向代理，见 README）
+  port: 8000
+  streamable_http_path: "/mcp"
+  sse_path: "/sse"
+  message_path: "/messages/"
+  stateless_http: false    # true = 不保存会话状态（多实例 / 负载均衡部署时开启）
+  json_response: false     # true = streamable-http 返回普通 JSON（便于 curl 调试）
+  # DNS rebinding 防护：留空 = SDK 默认（仅 localhost 自动开启）；
+  # 对外暴露到域名/IP 时建议显式配置，否则可能被 Host/Origin 校验拒绝（421）。
+  allowed_hosts: []        # 例：["127.0.0.1:*", "rag.example.com"]
+  allowed_origins: []      # 例：["http://localhost:*", "https://rag.example.com"]

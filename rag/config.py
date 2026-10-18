@@ -6,6 +6,7 @@
   行为都一致（MCP 客户端启动 server 时工作目录不可控，这一点很关键）。
 """
 
+import os
 from pathlib import Path
 from typing import Any, Dict
 
@@ -41,6 +42,17 @@ DEFAULTS: Dict[str, Any] = {
         "version": "0.1.0",
         "warmup": True,
         "log_level": "INFO",
+        # 传输方式：stdio（默认）| streamable-http | sse
+        "transport": "stdio",
+        "host": "127.0.0.1",
+        "port": 8000,
+        "streamable_http_path": "/mcp",
+        "sse_path": "/sse",
+        "message_path": "/messages/",
+        "stateless_http": False,
+        "json_response": False,
+        "allowed_hosts": [],
+        "allowed_origins": [],
     },
 }
 
@@ -80,6 +92,17 @@ def load_config(path: str | Path | None = None) -> Dict[str, Any]:
             config[section][key] = str((config_path.parent / raw).resolve())
         else:
             config[section][key] = str(raw)
+
+    # 环境变量覆盖（容器 / CI / 临时切换传输方式时不必改配置文件）
+    # 优先级：命令行参数 > 环境变量 > config.yaml > 代码默认值
+    for key, env_name in (
+        ("transport", "RAG_MCP_TRANSPORT"),
+        ("host", "RAG_MCP_HOST"),
+        ("port", "RAG_MCP_PORT"),
+    ):
+        raw = os.environ.get(env_name)
+        if raw:
+            config["server"][key] = int(raw) if key == "port" else raw
 
     return config
 
