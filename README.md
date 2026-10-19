@@ -370,6 +370,57 @@ docker run --rm -p 8000:8000 \
 > 因此容器场景下**不要**把 `RAG_MCP_EMBEDDING_OFFLINE` 设为 `true`（那是裸机离线演示用的开关）；
 > 用上面的 `-v` 挂载缓存后，重建镜像不会再下载。
 
+### 5.8 CI 门禁（`.github/workflows/ci.yml`）
+
+`ubuntu-latest` + Python 3.12 + `pip` 依赖缓存 + `pytest`，**离线可跑、不需要密钥、不下载模型**。
+
+> **宿主如实说明**：本仓库托管在 **Gitee（私有）**，Gitee 不会执行 GitHub Actions，也还没接 Gitee Go。
+> 这份 YAML 用的是**通用 GitHub Actions 格式**——镜像一份到 GitHub 即可直接生效，
+> 但在 Gitee 侧目前不是自动跑的流水线。也因此 README 里**不放 CI 徽章**：私有/异源仓库的徽章只会 404。
+
+两个环境变量各自对着一个真实坑，不是仪式感：
+
+| 环境变量 | 作用 |
+|---|---|
+| `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1` | runner 上没有 BGE 模型缓存。这两条把"模型缺失"从**静默联网下载几百 MB**变成**立刻报错**——宁可红得明确，不要绿得含糊 |
+| `NO_PROXY=127.0.0.1,localhost` | 有全局代理时回环请求也会被代理转发（实测回 502），子进程端到端用例会误报失败 |
+
+**门禁的能力缺口（写在这里，不藏在 YAML 注释里）**：有 13 个用例**必须**加载真实 BGE 模型
+（`test_service.py` 全部 8 个：module 级 fixture 一上来就 `build_index()`；3 个子进程端到端：server
+启动即预热索引；2 个用真实 `KnowledgeService` 建索引的服务层用例）。runner 上没有模型缓存、CI 又不下载
+模型，所以它们被**显式排除**——`--deselect` 清单逐条写在 `ci.yml` 里，`pytest` 汇总行会直接报出
+`13 deselected`，配额对不上就是配置漂了。排除是在**命令行**上做的、**没有改测试代码**：
+链路是 pytest 的 `deselected`，不是用例内的 `skipif` 标记。升级路径两条：① 在 CI 里预取那个 95MB 的
+小模型（锁 revision）后跑全量；② 给用例补 `skipif` 标记（要动 `tests/`，本次刻意没动）。
+
+本地一键复现同一条门禁（照抄可跑）：
+
+```bash
+python -m pip install -r requirements.txt && python -m pytest -q -rs \
+  --deselect tests/test_service.py::test_index_stats \
+  --deselect tests/test_service.py::test_search_returns_ranked_results \
+  --deselect tests/test_service.py::test_top_k_is_capped \
+  --deselect tests/test_service.py::test_out_of_domain_query_is_filtered \
+  --deselect tests/test_service.py::test_empty_query_rejected \
+  --deselect tests/test_service.py::test_result_is_json_serializable \
+  --deselect tests/test_service.py::test_concurrent_queries_compute_embedding_once_and_write_cache_atomically \
+  --deselect tests/test_service.py::test_concurrent_first_search_builds_index_only_once \
+  --deselect tests/test_http_transport.py::test_streamable_http_end_to_end \
+  --deselect tests/test_http_security.py::test_http_security_end_to_end \
+  --deselect tests/test_prompt_injection.py::test_real_sample_knowledge_base_has_no_false_positive \
+  --deselect tests/test_prompt_injection.py::test_service_flags_every_adversarial_document \
+  --deselect tests/test_prompt_injection.py::test_prompt_injection_guard_over_real_http
+```
+
+```text
+# 本机实测（Windows / Python 3.12.9），三种情形各跑一次：
+# ① 门禁命令 + 本机有 HF 缓存：        104 passed, 13 deselected in 0.92s
+# ② 门禁命令 + HF 缓存清空（= runner）：104 passed, 13 deselected in 0.87s
+# ③ 对照组：不清缓存但**不排除**这 13 个用例 → 3 failed, 104 passed, 10 errors（全是"拉不到模型"）
+#    —— 这样才知道要排除的恰好是 13 个，而不是"随手挑了几个让它变绿"
+# ④ 全量（有缓存、无排除）：117 passed in 30.04s（命令见 §5.3）
+```
+
 ---
 
 ## 6. 接入 Claude Desktop / Cursor
@@ -919,6 +970,7 @@ rag-mcp-server/
 ├── requirements.txt           # 固定版本依赖（实测通过；HTTP 生产化与注入防护均未新增任何依赖）
 ├── Dockerfile                 # 容器镜像（python:3.12-slim、非 root、EXPOSE 8000、HEALTHCHECK /healthz）※未本机验证
 ├── .dockerignore              # 构建上下文排除项（.venv / 缓存 / 测试 / 运行产物）
+├── .github/workflows/ci.yml   # CI 门禁（通用 GitHub Actions 格式；宿主 Gitee → 镜像到 GitHub 生效，见 §5.8）
 ├── rag/
 │   ├── config.py              # 配置加载：默认值合并 + 相对路径解析 + 环境变量覆盖 + device 自动探测
 │   ├── logging_utils.py       # 日志统一写 stderr（保住 stdout 给协议）

@@ -1,0 +1,79 @@
+# rag-mcp-server 的 CI 门禁（通用 GitHub Actions 格式）。
+#
+# 宿主说明：本仓库托管在 **Gitee（私有仓库）**，Gitee 不会执行 GitHub Actions
+# （Gitee Go 也暂未接入），所以本文件在 Gitee 侧只是"可执行的门禁声明"，
+# 镜像一份到 GitHub 即开即用（原因与本地复现命令见 README §5.8）。
+#
+# ★ 离线设计（CI runner 上没有本机那份 BGE 模型缓存，且本项目 CI **不下载模型**）：
+#   1) HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE = 1
+#      把"模型缺失"从"静默联网下载几百 MB"变成"立刻报错"——宁可红得明确，不要绿得含糊。
+#   2) 13 个**必须加载真实 BGE 模型**的用例在这里**显式排除**（`--ignore` / `--deselect` 清单见下，
+#      逐条注明理由）。排除是**在 CI 命令行上**做的（没有改测试代码）：
+#      写这项门禁时的约束是"不动 tests/"，因此链路是 `--deselect`（pytest 汇总里的 deselected）
+#      而不是用例里的 skipif 标记 —— 这一点连同升级路径如实写在 README §5.8。
+#   3) NO_PROXY / no_proxy 放行 127.0.0.1
+#      机器上有全局代理时，回环请求也会被代理转发（实测回 502），子进程端到端用例会误报失败。
+
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (ubuntu-latest / Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      NO_PROXY: "127.0.0.1,localhost"
+      no_proxy: "127.0.0.1,localhost"
+      PYTHONIOENCODING: "utf-8"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12（带 pip 缓存）
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装依赖
+        run: python -m pip install -r requirements.txt
+
+      # 期望结果：104 passed, 13 deselected（117 - 13 = 104；本机实测见 README §5.8）
+      # 排除的 13 个用例分三类：
+      #   ① tests/test_service.py 整个文件（8 个）：module 级 fixture 一上来就 build_index()，必须真实 BGE；
+      #   ② 3 个子进程端到端：server 启动即预热索引，同样要模型；
+      #   ③ 2 个用真实 KnowledgeService 建索引的服务层用例（real_service / adversarial_service）。
+      # 断言一条都没删：本机（有 HF 缓存）跑全量是 117 passed，命令见 README §5.3。
+      - name: 单元测试（离线；排除需要本机 BGE 模型缓存的用例）
+        run: |
+          python -m pytest -q -rs \
+            --deselect tests/test_service.py::test_index_stats \
+            --deselect tests/test_service.py::test_search_returns_ranked_results \
+            --deselect tests/test_service.py::test_top_k_is_capped \
+            --deselect tests/test_service.py::test_out_of_domain_query_is_filtered \
+            --deselect tests/test_service.py::test_empty_query_rejected \
+            --deselect tests/test_service.py::test_result_is_json_serializable \
+            --deselect tests/test_service.py::test_concurrent_queries_compute_embedding_once_and_write_cache_atomically \
+            --deselect tests/test_service.py::test_concurrent_first_search_builds_index_only_once \
+            --deselect tests/test_http_transport.py::test_streamable_http_end_to_end \
+            --deselect tests/test_http_security.py::test_http_security_end_to_end \
+            --deselect tests/test_prompt_injection.py::test_real_sample_knowledge_base_has_no_false_positive \
+            --deselect tests/test_prompt_injection.py::test_service_flags_every_adversarial_document \
+            --deselect tests/test_prompt_injection.py::test_prompt_injection_guard_over_real_http
