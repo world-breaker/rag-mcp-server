@@ -9,6 +9,7 @@
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -24,6 +25,16 @@ PROBE_QUERIES = [
     "LoRA 微调的原理和典型参数是什么？",
     "今天武汉的天气怎么样？",
 ]
+
+# 结果里的 text 已被防护层包裹（rag/prompt_guard.py）；打印预览时只展示正文本身
+_WRAP_HEAD_RE = re.compile(r"^<untrusted_data[^>]*>\n.*?--- 数据开始[^\n]*---\n", re.DOTALL)
+_WRAP_TAIL_RE = re.compile(r"\n--- 数据结束 ---\n</untrusted_data>$")
+
+
+def unwrap(text: str) -> str:
+    """去掉 <untrusted_data> 包裹（仅用于终端预览，不影响返回给模型的真实内容）。"""
+    return _WRAP_TAIL_RE.sub("", _WRAP_HEAD_RE.sub("", text))
+
 
 
 def main() -> int:
@@ -50,18 +61,23 @@ def main() -> int:
         print(
             f"    matched={payload['matched']} "
             f"filtered_by_threshold={payload['filtered_by_threshold']} "
-            f"elapsed={payload['elapsed_ms']}ms"
+            f"elapsed={payload['elapsed_ms']}ms "
+            f"sanitize_retrieved={payload['security']['sanitize_retrieved']}"
         )
         if payload["matched"] == 0:
             print(f"    hint: {payload.get('hint')}")
         for r in payload["results"]:
-            preview = r["text"].replace("\n", " ")[:60]
-            print(f"    rank={r['rank']} score={r['score']} source={r['source']} | {preview}...")
+            preview = unwrap(r["text"]).replace("\n", " ")[:60]
+            flag = "可疑" if r["suspicious"] else "正常"
+            print(
+                f"    rank={r['rank']} score={r['score']} source={r['source']} "
+                f"[{flag}] | {preview}..."
+            )
         print()
 
     print("完整结构化返回（以第 1 条探针为例）：")
     print(json.dumps(service.search(PROBE_QUERIES[0], top_k=2), ensure_ascii=False, indent=2)[:1200])
-    print("\n[OK] 检索链路可用（模型加载 + 索引 + 检索 + 阈值过滤 + 空结果降级）")
+    print("\n[OK] 检索链路可用（模型加载 + 索引 + 检索 + 阈值过滤 + 空结果降级 + 结果不可信包裹）")
     return 0
 
 

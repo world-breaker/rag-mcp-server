@@ -10,6 +10,7 @@
 
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -20,6 +21,15 @@ from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import stdio_client  # noqa: E402
 
 SERVER_SCRIPT = REPO_ROOT / "server.py"
+
+# 结果里的 text 已被防护层包裹（rag/prompt_guard.py）；终端预览只看正文
+_WRAP_HEAD_RE = re.compile(r"^<untrusted_data[^>]*>\n.*?--- 数据开始[^\n]*---\n", re.DOTALL)
+_WRAP_TAIL_RE = re.compile(r"\n--- 数据结束 ---\n</untrusted_data>$")
+
+
+def unwrap(text: str) -> str:
+    return _WRAP_TAIL_RE.sub("", _WRAP_HEAD_RE.sub("", text))
+
 
 
 async def main() -> int:
@@ -54,10 +64,13 @@ async def main() -> int:
                     is_error = getattr(result, "isError", False)
                 print(f"\n[client] tools/call search_knowledge(query={query!r}, top_k=2)")
                 print(f"         isError={is_error} matched={payload['matched']} "
-                      f"filtered_by_threshold={payload['filtered_by_threshold']}")
+                      f"filtered_by_threshold={payload['filtered_by_threshold']} "
+                      f"untrusted_content={payload['security']['trust']}")
                 for r in payload["results"]:
-                    preview = r["text"].replace("\n", " ")[:50]
-                    print(f"         rank={r['rank']} score={r['score']} source={r['source']} | {preview}...")
+                    preview = unwrap(r["text"]).replace("\n", " ")[:50]
+                    flag = "可疑" if r["suspicious"] else "正常"
+                    print(f"         rank={r['rank']} score={r['score']} source={r['source']} "
+                          f"[{flag}] | {preview}...")
                 if payload["matched"] == 0:
                     print(f"         hint: {payload.get('hint')}")
 

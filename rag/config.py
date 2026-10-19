@@ -37,6 +37,23 @@ DEFAULTS: Dict[str, Any] = {
         "similarity_threshold": 0.3,
         "max_top_k": 10,
     },
+    # 检索结果的提示注入防护（间接注入：知识库文档里藏着指令，上层模型把「资料」当「命令」）。
+    # 详见 rag/prompt_guard.py 与 README §7「安全」。
+    "security": {
+        # 默认开启：结构化包裹（<untrusted_data>）+ 可疑模式标注/中和。
+        # 关掉后退化为「原文直出」，只保留 trust 标记（给已有调用方平滑迁移用）。
+        "sanitize_retrieved": True,
+        # 是否在结果里附带**未中和**的原文；默认关闭（只用于调试与对照评测）
+        "include_raw_text": False,
+        # 超长单行阈值（超过则折行并标记 overlong_line）
+        "max_line_chars": 4000,
+        # 折行宽度
+        "line_wrap_width": 200,
+        # base64 大块阈值（字符数，按去填充后的有效载荷计）
+        "base64_min_chars": 200,
+        # 是否对 base64 大块做一次有界解码、再扫描解码结果（只递归一层）
+        "base64_decode_scan": True,
+    },
     "server": {
         "name": "rag-mcp-server",
         "version": "0.1.0",
@@ -95,6 +112,12 @@ def load_config(path: str | Path | None = None) -> Dict[str, Any]:
     config["_config_path"] = str(config_path)
     config["_config_dir"] = config_path.parent
 
+    # 知识库路径可由环境变量指定（容器里挂载知识库、测试时指向对抗语料都用得上）。
+    # 填相对路径时同样按「配置文件所在目录」解析（见下面的统一解析循环）。
+    raw_kb_path = os.environ.get("RAG_MCP_KB_PATH")
+    if raw_kb_path:
+        config["knowledge_base"]["path"] = raw_kb_path
+
     # 相对路径 → 绝对路径
     for section, key in [
         ("knowledge_base", "path"),
@@ -131,6 +154,16 @@ def load_config(path: str | Path | None = None) -> Dict[str, Any]:
     raw_burst = os.environ.get("RAG_MCP_RATE_LIMIT_BURST")
     if raw_burst:
         config["server"]["rate_limit"]["burst"] = int(raw_burst)
+
+    # 提示注入防护开关（默认开启；关掉用于对照评测「有防护 / 无防护」的差异）
+    raw_sanitize = os.environ.get("RAG_MCP_SANITIZE_RETRIEVED")
+    if raw_sanitize is not None and raw_sanitize != "":
+        config["security"]["sanitize_retrieved"] = str(raw_sanitize).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
 
     # embedding.offline：容器里通常没有 HuggingFace 缓存，需要放开联网下载一次；
     # 生产建议挂载缓存目录并保持 offline=true（见 README Docker 一节）

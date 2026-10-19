@@ -14,6 +14,7 @@ from rag.chunking import FixedSizeChunker
 from rag.config import load_config
 from rag.embedding import EmbeddingEngine
 from rag.logging_utils import get_logger
+from rag.prompt_guard import PromptGuard
 from rag.retrieval import RetrievalEngine
 
 logger = get_logger()
@@ -26,6 +27,9 @@ class KnowledgeService:
         self.config = config or load_config()
         self.chunker = FixedSizeChunker(self.config)
         self.retriever = RetrievalEngine(self.config)
+        # 提示注入防护：只作用于**返回给上层**的文本，不参与索引与向量化
+        # （对知识库原文做中和会改变检索语义，那是另一件事；这里只隔离「输出面」）
+        self.guard = PromptGuard(self.config)
         self.embedder: EmbeddingEngine | None = None  # 懒加载：不检索就不加载模型
 
         self.documents: List[Dict] = []
@@ -165,17 +169,10 @@ class KnowledgeService:
             "matched": len(results),
             "filtered_by_threshold": filtered,
             "elapsed_ms": elapsed_ms,
-            "results": [
-                {
-                    "rank": r["retrieved_rank"],
-                    "score": r["score"],
-                    "source": r.get("source", "unknown"),
-                    "chunk_index": r.get("chunk_index"),
-                    "text": r["text"],
-                }
-                for r in results
-            ],
+            "results": [self._guard_result(r) for r in results],
         }
+        # 结构化隔离：告诉上层「这些是不可信数据」，并汇总本次命中情况（供审计与指标）
+        payload["security"] = self.guard.security_summary(payload["results"])
         if not results:
             payload["hint"] = (
                 "知识库中没有相似度高于阈值的内容："
@@ -185,6 +182,14 @@ class KnowledgeService:
         return payload
 
     # ========== 元信息 ==========
+
+    def _guard_result(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        """把一条检索结果交给防护层格式化（原字段全保留，只增字段与包裹）。
+
+        `security.sanitize_retrieved=false` 时正文原样返回，只保留 `trust` 标记——
+        这样已有调用方（或对照实验）可以随时切回旧形态，而不必改代码。
+        """
+        return self.guard.guard_result(raw)
 
     def stats(self) -> Dict[str, Any]:
         """索引元信息：知识库范围、模型、缓存命中情况——供调用方（和人）判断能力边界。"""
@@ -208,4 +213,7 @@ class KnowledgeService:
             "index_build_count": self.build_count,
             "index_build_seconds": self.build_seconds,
             "search_count": self.search_count,
+            # 防护状态：调用方不必读配置文件就知道当前返回的是哪种形态
+            "sanitize_retrieved": self.guard.enabled,
+            "untrusted_data_wrapper": self.guard.enabled,
         }

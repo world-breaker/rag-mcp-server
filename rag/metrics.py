@@ -5,7 +5,7 @@
   而且它的 `Summary` 只支持客户端侧分位数估算（`_sum/_count/quantile`），本项目也不需要更复杂的能力；
 - 零依赖意味着**任何环境装完 requirements.txt 就能 /metrics**，不会因为指标库版本引发启动失败
   （这是「可观测性不能成为故障源」的取舍：指标挂了不该拖垮服务）；
-- 代价：没有 Histogram bucket、没有多进程聚合。多副本部署时应由网关/边车统一采集（见 README §11）。
+- 代价：没有 Histogram bucket、没有多进程聚合。多副本部署时应由网关/边车统一采集（见 README §12）。
 
 指标清单（名字与 README 的表格一一对应）：
 - `rag_mcp_requests_total{status}`   —— HTTP 请求总数（按响应状态码分组）
@@ -13,6 +13,7 @@
 - `rag_mcp_errors_total`             —— 错误总数（HTTP 5xx + 工具异常）
 - `rag_mcp_request_duration_ms{quantile}` —— 请求耗时摘要（毫秒，最近 N 次采样的估算分位数）
 - `rag_mcp_auth_failures_total` / `rag_mcp_rate_limited_total` —— 鉴权失败 / 被限流拒绝次数
+- `rag_mcp_prompt_injection_findings_total{rule}` —— 检索结果里命中的提示注入可疑模式次数
 - `rag_mcp_uptime_seconds`           —— 进程内指标表存活时长（用于判断是否重启过）
 
 线程安全：MCP 的工具处理可能在别的线程执行，因此所有写入都过一把可重入之外的普通互斥锁
@@ -35,6 +36,7 @@ _HELP = {
     "request_duration_ms": "HTTP 请求耗时摘要（毫秒；分位数为最近采样的估算值）",
     "auth_failures_total": "鉴权失败（401）次数",
     "rate_limited_total": "被令牌桶限流拒绝（429）的次数",
+    "prompt_injection_findings_total": "检索结果中命中的提示注入可疑模式次数（按规则分组）",
     "uptime_seconds": "指标表存活时长（秒）",
 }
 
@@ -64,6 +66,7 @@ class Metrics:
         self._errors = 0
         self._auth_failures = 0
         self._rate_limited = 0
+        self._injection_findings: Counter = Counter()   # 规则 id -> 命中次数
         self._durations: deque = deque(maxlen=max_samples)
         self._duration_sum_ms = 0.0
         self._duration_count = 0
@@ -98,6 +101,16 @@ class Metrics:
         with self._lock:
             self._rate_limited += 1
 
+    def record_injection_findings(self, counts: Dict[str, int]) -> None:
+        """记录检索结果里命中的提示注入可疑模式（规则 id -> 次数）。
+
+        为什么值得单独成为指标：注入命中率是**数据面**的安全信号，
+        能提前暴露「知识库里混进了被投毒的文档」，而不是等上层 Agent 被带偏才发现。
+        """
+        with self._lock:
+            for rule, count in (counts or {}).items():
+                self._injection_findings[str(rule)] += int(count)
+
     # ========== 读取 ==========
 
     def uptime_seconds(self) -> float:
@@ -116,6 +129,7 @@ class Metrics:
                 self._auth_failures,
                 self._rate_limited,
             )
+            injection_findings = dict(self._injection_findings)
         return {
             "requests_total": requests,
             "requests_total_sum": sum(requests.values()),
@@ -123,6 +137,7 @@ class Metrics:
             "errors_total": errors,
             "auth_failures_total": auth_failures,
             "rate_limited_total": rate_limited,
+            "prompt_injection_findings_total": injection_findings,
             "request_duration_ms": {
                 "count": total,
                 "sum": round(sum_ms, 3),
@@ -176,6 +191,16 @@ class Metrics:
         header("rate_limited_total", "counter")
         lines.append(f"rag_mcp_rate_limited_total {snap['rate_limited_total']}")
 
+        header("prompt_injection_findings_total", "counter")
+        if snap["prompt_injection_findings_total"]:
+            for rule, count in sorted(snap["prompt_injection_findings_total"].items()):
+                lines.append(
+                    f'rag_mcp_prompt_injection_findings_total{{rule="{_escape_label(rule)}"}} {count}'
+                )
+        else:
+            # 无样本时也输出 0 值（规则 id 未知 → 用 none 占位），仪表盘不会因样本缺失报错
+            lines.append('rag_mcp_prompt_injection_findings_total{rule="none"} 0')
+
         header("uptime_seconds", "gauge")
         lines.append(f"rag_mcp_uptime_seconds {snap['uptime_seconds']}")
 
@@ -184,3 +209,4 @@ class Metrics:
 
 #: 进程级单例：server.py 的中间件与工具函数共用一个指标表
 METRICS = Metrics()
+

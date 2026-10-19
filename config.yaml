@@ -24,6 +24,17 @@ retrieval:
   similarity_threshold: 0.3  # 余弦相似度低于此值的内容不返回（宁可不答，不喂噪音）
   max_top_k: 10            # top_k 硬上限：约束单次调用注入模型上下文的最大长度
 
+# ===== 提示注入防护（间接注入：知识库文档里藏着指令，上层模型把「资料」当「命令」）=====
+# 实现见 rag/prompt_guard.py；威胁模型与诚实边界见 README §7。
+# 注意：本层是纵深防御的一层，**不能**替代上层 Agent 的信任边界与工具权限控制。
+security:
+  sanitize_retrieved: true   # 默认开启：结构化包裹 <untrusted_data> + 可疑模式标注/中和（关掉 = 原文直出，只保留 trust 标记）
+  include_raw_text: false    # 是否附带未中和的原文；默认关闭（仅调试/对照评测时开，等于放弃这层防护）
+  max_line_chars: 4000       # 超长单行阈值：超过则折行并标记 overlong_line
+  line_wrap_width: 200       # 折行宽度
+  base64_min_chars: 200      # base64 大块阈值（按去填充后的有效载荷计）
+  base64_decode_scan: true   # 对 base64 大块做一次有界解码，再扫描解码结果（只递归一层）
+
 server:
   name: "rag-mcp-server"
   version: "0.1.0"
