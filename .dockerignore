@@ -1,5 +1,13 @@
 # 构建上下文排除清单：这些目录进了镜像只会让镜像变大、构建变慢
 # （.venv 里有 torch，几百 MB；data/embedding_cache 是本机索引缓存，容器里会重新生成）
+#
+# 审计结论（2026-10-19，本机无 Docker 的静态核对，可重复跑
+# `python scripts/check_dockerfile_consistency.py` 的 [F] 段）：
+# 按下面的规则遍历仓库后，构建上下文只剩 29 个文件——.venv/（本机 1046MB）、.git/、
+# data/embedding_cache/、__pycache__/、*.pyc、.pytest_cache/ 全被剪掉，而运行必需的
+# server.py / config.yaml / requirements.txt / rag/*.py / data/sample/knowledge_base.json 都在。
+# 下面几条规则在当前文件树上没有命中项（logs/ 、eval_results/ 、*.log 、*.jsonl 、.env），
+# 是给「本机跑出来的运行产物」留的防线，不是装饰。
 
 # 虚拟环境 / 版本库
 .venv/

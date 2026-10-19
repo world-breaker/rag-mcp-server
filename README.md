@@ -354,21 +354,44 @@ curl -i -H "Authorization: Bearer please-change-me" http://127.0.0.1:8000/mcp
 ```bash
 # 构建
 docker build -t rag-mcp-server:dev .
+```
 
-# 运行（把模型缓存挂出来，避免每次重建镜像都重新下载 BGE 模型）
+> ⚠️ **Dockerfile 未在本机验证**：开发机没装 Docker，`docker build` / `docker run` **一次都没跑过**，
+> `Dockerfile` / `.dockerignore` 是按最佳实践写的「待验证」产物；首次构建可能需要按你所在网络环境微调。
+> **「未验证」的边界说清楚**：能静态核对的每一项都已取证、且可重复跑——
+> `.venv\Scripts\python.exe scripts/check_dockerfile_consistency.py`（26 项：CMD 的选项/取值真在 argparse 里、
+> ENV 的 `RAG_MCP_*` 真被 `rag/config.py` 读取、端口在四个地方一致、`/healthz` 真注册且真返回 `index_ready`、
+> 全部第三方 import 都被 requirements 覆盖、COPY 路径存在、`.dockerignore` 没误伤）＋ `hadolint Dockerfile`（0 告警）。
+> **仍未验证**的：build 能否成功、run 能否起服务、`HEALTHCHECK` 真实行为、镜像体积、
+> 非 root 权限是否真的够用、apt/pip/HuggingFace 的网络可达性。别把静态绿灯外推成这些。
+
+**模型缓存是容器场景唯一的必答项。** `config.yaml` 默认 `embedding.offline: true`（只读本地缓存），
+而镜像里**没有**模型（`HF_HOME` 只是个空目录），`server.py` 又是**先 `warmup()` 再 `server.run()`**——
+所以「没挂缓存 + 没放开联网」的容器**会直接退出**，不是起得慢。本机实测（把 `HF_HOME` 指到空目录、
+不设 `RAG_MCP_EMBEDDING_OFFLINE`）：warmup 抛
+`OSError: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.`
+两条可行路径二选一，**必须显式选一条**：
+
+```bash
+# 路径 A（推荐）：挂宿主机上已经下好的缓存 → 启动完全离线、可复现
 docker run --rm -p 8000:8000 \
-  -e RAG_MCP_TRANSPORT=streamable-http \
-  -e RAG_MCP_HOST=0.0.0.0 \
+  -v "$HOME/.cache/huggingface:/home/app/.cache/huggingface:ro" \
   -e RAG_MCP_AUTH_TOKEN=please-change-me \
+  rag-mcp-server:dev
+
+# 路径 B：首次运行允许联网下载一次（BGE-small-zh-v1.5 约 95MB），缓存落到卷里留给下次
+docker run --rm -p 8000:8000 \
   -v rag-hf-cache:/home/app/.cache/huggingface \
+  -e RAG_MCP_EMBEDDING_OFFLINE=false \
+  -e RAG_MCP_AUTH_TOKEN=please-change-me \
   rag-mcp-server:dev
 ```
 
-> ⚠️ **Dockerfile 未在本机验证**：开发机未安装 Docker，`Dockerfile` / `.dockerignore` 是按最佳实践编写、
-> **未实际 `docker build` 运行过的**产物，首次构建可能需要按你所在网络环境微调
-> （例如模型需能从 HuggingFace 拉取）。容器内**首次启动要联网下载** `BAAI/bge-small-zh-v1.5`，
-> 因此容器场景下**不要**把 `RAG_MCP_EMBEDDING_OFFLINE` 设为 `true`（那是裸机离线演示用的开关）；
-> 用上面的 `-v` 挂载缓存后，重建镜像不会再下载。
+> **镜像里装的是官方 CPU 版 torch**（`torch==2.14.1+cpu`，196MB）。原因：PyPI 上 Linux 侧的
+> `torch==2.14.1` 是 **554MB 的 CUDA 轮子**，其元数据还会连带拉
+> `cuda-toolkit[…]` / `nvidia-cudnn-cu13` / `nvidia-nccl-cu13` 等若干 GB，而容器既没有 GPU
+> 也没有 nvidia runtime，这些库纯属死重。Dockerfile 里那两行有完整取证、以及「网络访问不了
+> download.pytorch.org 时怎么退回」的一句话说明。
 
 ### 5.8 CI 门禁（`.github/workflows/ci.yml`）
 
@@ -968,7 +991,7 @@ rag-mcp-server/
 ├── server.py                  # MCP Server 入口（stdio / streamable-http / sse）：工具定义 + 预热 + /healthz + /metrics
 ├── config.yaml                # 知识库 / 切分 / embedding / 检索 / 传输 / 安全（提示注入防护 + auth / rate_limit / 豁免路径）
 ├── requirements.txt           # 固定版本依赖（实测通过；HTTP 生产化与注入防护均未新增任何依赖）
-├── Dockerfile                 # 容器镜像（python:3.12-slim、非 root、EXPOSE 8000、HEALTHCHECK /healthz）※未本机验证
+├── Dockerfile                 # 容器镜像（python:3.12-slim、非 root、EXPOSE 8000、HEALTHCHECK /healthz、torch CPU 轮子）※未本机验证
 ├── .dockerignore              # 构建上下文排除项（.venv / 缓存 / 测试 / 运行产物）
 ├── .github/workflows/ci.yml   # CI 门禁（通用 GitHub Actions 格式；宿主 Gitee → 镜像到 GitHub 生效，见 §5.8）
 ├── rag/
@@ -985,6 +1008,8 @@ rag-mcp-server/
 │   ├── smoke_test.py          # 冒烟：不经协议，直接验证检索链路（含领域外问题探针）
 │   ├── mcp_client_demo.py     # 端到端：官方 MCP 客户端 stdio 调用（含 tools/list）
 │   ├── mcp_http_client_demo.py# 端到端：连接已运行的 HTTP Server（streamable-http / sse）
+│   ├── demo_http_security.py  # HTTP 安全能力演示：真起服务子进程，逐条实测 401/429/healthz/注入防护
+│   ├── check_dockerfile_consistency.py # Dockerfile ↔ 仓库现状 静态一致性检查（无 Docker 也能跑，26 项）
 │   └── bench_http.py          # HTTP 压测：长连接、并发×轮次，输出 p50/p95/p99/QPS/错误率
 ├── tests/
 │   ├── test_service.py        # 8 个检索行为契约 + 并发（原子写缓存 / 索引只建一次）测试
