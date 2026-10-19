@@ -10,6 +10,11 @@ data/embedding_cache/
 *.log
 logs/
 
+# 本地会话 / 索引类产物（可再生成，不入库）：将来若引入 jsonl 记录或 sqlite 索引，别误提交
+*.jsonl
+*.sqlite
+*.sqlite3
+
 # 本地环境变量（本项目不需要 key，占位以防误提交）
 .env
 
