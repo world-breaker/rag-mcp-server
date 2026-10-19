@@ -1,0 +1,29 @@
+# 构建上下文排除清单：这些目录进了镜像只会让镜像变大、构建变慢
+# （.venv 里有 torch，几百 MB；data/embedding_cache 是本机索引缓存，容器里会重新生成）
+
+# 虚拟环境 / 版本库
+.venv/
+venv/
+.git/
+.gitignore
+
+# Python 产物
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 运行产物与本地缓存
+data/embedding_cache/
+*.log
+logs/
+eval_results/
+*.jsonl
+
+# 本地环境变量（本项目不需要 key，占位以防误打进镜像）
+.env
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

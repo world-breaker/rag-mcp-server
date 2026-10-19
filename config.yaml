@@ -47,3 +47,13 @@ server:
   # 对外暴露到域名/IP 时建议显式配置，否则可能被 Host/Origin 校验拒绝（421）。
   allowed_hosts: []        # 例：["127.0.0.1:*", "rag.example.com"]
   allowed_origins: []      # 例：["http://localhost:*", "https://rag.example.com"]
+
+  # ===== 安全层（只作用于 HTTP 传输；stdio 是父子进程模式，不受鉴权/限流影响）=====
+  auth:
+    enabled: false         # true = 校验 Authorization: Bearer <token>；首行之外一律 401
+    token: ""              # 建议留空，改用环境变量 RAG_MCP_AUTH_TOKEN（设置了它即自动启用鉴权）
+  rate_limit:
+    rps: 0                 # 令牌桶速率（每秒补充多少请求）；<=0 = 关闭（默认关闭，见 README §5.6.2）
+    burst: 0               # 桶容量（允许的突发量）；<=0 时取 ceil(rps)
+  # 不鉴权、不限流的路径：健康检查与指标采集必须无需凭证即可访问（k8s 探针 / Prometheus）
+  security_exempt_paths: ["/healthz", "/metrics"]

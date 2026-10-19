@@ -5,6 +5,7 @@
 """
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -34,6 +35,10 @@ class KnowledgeService:
         self.build_count = 0
         self.build_seconds: float | None = None
         self.search_count = 0
+
+        # 建索引单飞锁：HTTP 下多个请求可能同时发现「索引还没建」，
+        # 没有锁就会并发建 N 次（重复加载模型/重复编码）。有了锁只建一次，其余线程等它建完直接复用。
+        self._build_lock = threading.Lock()
 
     # ========== 文档加载 ==========
 
@@ -107,8 +112,17 @@ class KnowledgeService:
         )
 
     def _ensure_index(self) -> None:
-        if self.doc_embeddings is None or not self.chunks:
-            self.build_index()
+        """懒加载索引（单飞）：只有第一个发现「还没建」的线程去建，其余线程等它建完复用。"""
+        if self.index_ready():
+            return
+        with self._build_lock:
+            # 双检：等锁期间可能已经被别的线程建好了
+            if not self.index_ready():
+                self.build_index()
+
+    def index_ready(self) -> bool:
+        """只读判断：索引是否已就绪（不触发任何构建；/healthz 也用它）。"""
+        return self.doc_embeddings is not None and bool(self.chunks)
 
     def warmup(self) -> None:
         """服务启动时预热：把「模型加载 + 建索引」的耗时挪到启动阶段，

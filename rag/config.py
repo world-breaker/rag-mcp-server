@@ -53,6 +53,19 @@ DEFAULTS: Dict[str, Any] = {
         "json_response": False,
         "allowed_hosts": [],
         "allowed_origins": [],
+        # 安全层（仅 HTTP 传输生效，stdio 是父子进程模式，不受影响）
+        # auth：Bearer 鉴权；enabled=false 时 token 留空即可
+        "auth": {
+            "enabled": False,
+            "token": "",  # 也可用环境变量 RAG_MCP_AUTH_TOKEN（优先级更高，避免密钥进版本库）
+        },
+        # rate_limit：令牌桶限流；rps<=0 表示关闭（默认关闭：本机/单客户端开发时不希望被自己的探针打到 429）
+        "rate_limit": {
+            "rps": 0,
+            "burst": 0,  # <=0 时取 ceil(rps)（即 1 秒的配额）作为突发量
+        },
+        # 不鉴权、不限流的路径（健康检查 / 指标采集必须无凭证可访问）
+        "security_exempt_paths": ["/healthz", "/metrics"],
     },
 }
 
@@ -103,6 +116,27 @@ def load_config(path: str | Path | None = None) -> Dict[str, Any]:
         raw = os.environ.get(env_name)
         if raw:
             config["server"][key] = int(raw) if key == "port" else raw
+
+    # 安全层：密钥与阈值几乎总是由环境变量注入（容器编排里 config 文件是只读的、
+    # 而且 token 不该进版本库），所以这里也支持环境变量覆盖
+    auth_env_token = os.environ.get("RAG_MCP_AUTH_TOKEN")
+    if auth_env_token:
+        config["server"]["auth"]["token"] = auth_env_token
+        # 设置了 token 就默认启用鉴权：避免「配了 token 却因为忘了改 enabled 而裸奔」这个高频坑
+        config["server"]["auth"]["enabled"] = True
+
+    raw_rps = os.environ.get("RAG_MCP_RATE_LIMIT_RPS")
+    if raw_rps:
+        config["server"]["rate_limit"]["rps"] = float(raw_rps)
+    raw_burst = os.environ.get("RAG_MCP_RATE_LIMIT_BURST")
+    if raw_burst:
+        config["server"]["rate_limit"]["burst"] = int(raw_burst)
+
+    # embedding.offline：容器里通常没有 HuggingFace 缓存，需要放开联网下载一次；
+    # 生产建议挂载缓存目录并保持 offline=true（见 README Docker 一节）
+    raw_offline = os.environ.get("RAG_MCP_EMBEDDING_OFFLINE")
+    if raw_offline is not None and raw_offline != "":
+        config["embedding"]["offline"] = str(raw_offline).strip().lower() in ("1", "true", "yes", "on")
 
     return config
 

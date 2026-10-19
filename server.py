@@ -7,6 +7,12 @@
 - sse（旧版 HTTP）：`python server.py --transport sse --port 8000`，端点为 `/sse` + `/messages/`，
   仅为兼容旧客户端保留。
 
+HTTP 生产化能力（**只作用于 HTTP 传输**，stdio 零影响）：
+- Bearer 鉴权：`server.auth.enabled` + token（环境变量 `RAG_MCP_AUTH_TOKEN` 优先），失败 401 JSON；
+- 令牌桶限流：`server.rate_limit.rps / burst`，按 token 计价、无 token 按客户端 IP，超限 429 + `Retry-After`；
+- `/healthz`：只读健康检查（状态、索引是否就绪、文档数、chunk 数），不触发建索引、不鉴权；
+- `/metrics`：Prometheus 文本指标（零额外依赖，见 rag/metrics.py），不鉴权。
+
 启动方式：
     python server.py                                   # stdio（默认）
     python server.py --transport streamable-http        # HTTP（默认 127.0.0.1:8000/mcp）
@@ -25,9 +31,13 @@ import json
 import sys
 
 from mcp.server.mcpserver import MCPServer
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse
 
 from rag.config import load_config
+from rag.http_security import SecurityMiddleware, SecuritySettings
 from rag.logging_utils import get_logger
+from rag.metrics import METRICS
 from rag.service import KnowledgeService
 
 config = load_config()
@@ -36,9 +46,38 @@ logger = get_logger("rag_mcp.server", level=config["server"].get("log_level", "I
 # 检索服务：进程级单例，索引只构建一次
 service = KnowledgeService(config)
 
-server = MCPServer(
+
+class SecureMCPServer(MCPServer):
+    """MCPServer + HTTP 安全层。
+
+    做法：**继承并覆盖** `streamable_http_app()` / `sse_app()` —— 让 SDK 先生成好标准 ASGI 应用，
+    再在外面套一层 `SecurityMiddleware`（鉴权 + 限流 + 指标）。
+
+    为什么不在 `main()` 里自己 `uvicorn.run()`：那样就要复刻 SDK 的 uvicorn 配置（log_level、
+    会话管理器 lifespan 等），SDK 升级时容易漏改；覆写这两个方法后，
+    `server.run(transport, **kwargs)` 的调用路径完全不变，stdio 分支连应用都不会创建。
+    """
+
+    def __init__(self, *args, security: SecuritySettings, metrics=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.security = security
+        self.metrics = metrics
+
+    def _wrap(self, app):
+        return SecurityMiddleware(app, settings=self.security, metrics=self.metrics)
+
+    def streamable_http_app(self, **kwargs):  # type: ignore[override]
+        return self._wrap(super().streamable_http_app(**kwargs))
+
+    def sse_app(self, **kwargs):  # type: ignore[override]
+        return self._wrap(super().sse_app(**kwargs))
+
+
+server = SecureMCPServer(
     name=config["server"]["name"],
     version=config["server"]["version"],
+    security=SecuritySettings.from_config(config["server"]),
+    metrics=METRICS,
     instructions=(
         "RAG 知识库检索服务。用 search_knowledge 检索本地知识库并拿到带相似度分数的原文片段；"
         "回答用户问题时先检索、再基于返回片段作答，不要凭记忆编造。"
@@ -62,11 +101,16 @@ def search_knowledge(query: str, top_k: int = 3) -> str:
         payload = service.search(query, top_k=top_k)
     except Exception as exc:  # 把内部异常转成结构化错误，而不是让协议层报错
         logger.exception(f"search_knowledge 失败：{exc}")
+        METRICS.record_error()
         payload = {
             "query": query,
             "error": f"{type(exc).__name__}: {exc}",
             "results": [],
         }
+    finally:
+        # 指标在工具函数里自增（而不是解析 HTTP 请求体）：中间件刻意不碰请求体
+        # —— 读了 body 就得自己缓存重放，会破坏 streamable-http 的流式语义
+        METRICS.record_tool_call("search_knowledge")
     # ensure_ascii=False：中文原文直接可读，避免 \\u4e2d 转义串占满上下文
     return json.dumps(payload, ensure_ascii=False)
 
@@ -83,7 +127,44 @@ def knowledge_base_stats() -> str:
         return json.dumps(service.stats(), ensure_ascii=False)
     except Exception as exc:
         logger.exception(f"knowledge_base_stats 失败：{exc}")
+        METRICS.record_error()
         return json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False)
+    finally:
+        METRICS.record_tool_call("knowledge_base_stats")
+
+
+# ========== HTTP 运维端点（不鉴权、不限流：见 http_security.DEFAULT_EXEMPT_PATHS）==========
+# 用 SDK 自带的 custom_route 注册，路由与应用同生命周期；不会被包进鉴权逻辑里。
+
+@server.custom_route("/healthz", methods=["GET"], include_in_schema=False)
+async def healthz(request: Request) -> JSONResponse:
+    """只读健康检查：**不触发建索引**，只报告当前内存里的真实状态。
+
+    `index_ready=false` 表示索引还没建好（例如 warmup 被关掉、第一次检索尚未发生），
+    此时服务进程是活的但检索会先付一次建索引的延迟——所以两者要分开报告，
+    而不是笼统地回一个 200/ok 让探针误判。
+    """
+    index_ready = service.index_ready()  # 只读判断，绝不触发建索引
+    return JSONResponse(
+        {
+            "status": "ok" if index_ready else "starting",
+            "index_ready": index_ready,
+            "documents": len(service.documents),
+            "chunks": len(service.chunks),
+            "version": config["server"]["version"],
+            "uptime_seconds": METRICS.uptime_seconds(),
+        }
+    )
+
+
+@server.custom_route("/metrics", methods=["GET"], include_in_schema=False)
+async def metrics(request: Request) -> PlainTextResponse:
+    """Prometheus 文本格式指标（零额外依赖，见 rag/metrics.py）。"""
+    return PlainTextResponse(
+        METRICS.render_prometheus(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -206,6 +287,16 @@ def main(argv=None) -> None:
     logger.info(f"端点：{_endpoint_hint(transport, kwargs)}")
     if transport == "streamable-http" and kwargs.get("stateless_http"):
         logger.info("streamable-http 运行在 stateless 模式（不保存会话状态）")
+
+    if transport == "stdio":
+        # 明确打一行：让日志本身就能回答「为什么 stdio 没有鉴权」这个问题
+        logger.info("安全层：stdio 传输不启用鉴权/限流（父子进程本地通信，无网络入口）")
+    else:
+        logger.info(f"安全层：{server.security.describe()}")
+        logger.info(
+            f"运维端点：http://{kwargs['host']}:{kwargs['port']}/healthz"
+            f"（健康检查）、/metrics（Prometheus 指标）"
+        )
 
     if config["server"].get("warmup", True):
         service.warmup()  # 预热：避免首次工具调用撞上客户端超时

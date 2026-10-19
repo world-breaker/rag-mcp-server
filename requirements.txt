@@ -18,5 +18,11 @@ PyYAML==6.0.3
 # HTTP 传输（streamable-http / sse）：MCP SDK 的 HTTP 传输在运行时会 import uvicorn
 uvicorn>=0.30
 
+# 说明：本项目**没有为 HTTP 生产化新增任何依赖**——
+# - starlette（ASGI 应用/路由）与 httpx2（HTTP 客户端）都是 mcp 的传递依赖，
+#   /healthz、/metrics 路由与 scripts/bench_http.py 直接复用它们；
+# - /metrics 的 Prometheus 文本是自己拼的（rag/metrics.py），
+#   刻意不引 prometheus_client：指标不该成为启动失败的风险源（见 README §9 取舍表）。
+
 # 测试（可选）
 pytest==9.1.1

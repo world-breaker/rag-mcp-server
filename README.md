@@ -7,6 +7,8 @@
 - 工具 1：`search_knowledge(query, top_k=3)` → 返回最相关片段 + 相似度分数（JSON）
 - 工具 2：`knowledge_base_stats()` → 返回索引元信息（文档数 / chunk 数 / 模型 / 阈值 / 缓存命中）
 - 检索实现：BGE-small-zh-v1.5 向量（512 维）+ NumPy 余弦相似度 + 阈值过滤 + 文本 MD5 缓存
+- HTTP 生产化（§5.6）：Bearer 鉴权、令牌桶限流、`/healthz`、Prometheus `/metrics`（零额外依赖）、
+  Dockerfile、压测脚本 `scripts/bench_http.py`（本机实测 ~250 QPS / p99 ~113ms，0 错误）
 - 与同源项目 [rag-eval-platform](../rag-eval-platform) 的关系：**检索链路同源、最小化移植**（见下文差异表）
 
 ---
@@ -156,6 +158,11 @@ pip install -r requirements.txt
 .venv\Scripts\python.exe -m pytest tests -v
 ```
 
+> 本机实测 **46 passed**：检索行为契约 8（`test_service.py`）＋ 传输 8（`test_http_transport.py`）
+> ＋ HTTP 安全 30（`test_http_security.py`，含 1 个子进程端到端用例）。
+> ⚠️ 跑 HTTP 相关用例前若本机挂了全局代理，先设 `NO_PROXY=127.0.0.1,localhost`——
+> 否则对 `127.0.0.1` 的请求会被代理转发，回一个与预期不符的 502。
+
 ### 5.4 手工启动 Server（只用来观察日志，正常由客户端拉起）
 
 ```bash
@@ -228,9 +235,9 @@ HTTP 客户端接入（Cursor / 支持远程 MCP 的客户端）：
 
 **安全与部署注意**：
 
-- 默认只绑定 `127.0.0.1`，本机可用；对外提供服务改 `--host 0.0.0.0`，
-  但**必须**配合鉴权（MCP 的 OAuth `auth_server_provider` / `token_verifier`）或反向代理，
-  不要把无鉴权的检索服务直接暴露到公网。
+- 默认只绑定 `127.0.0.1`，本机可用；对外提供服务改 `--host 0.0.0.0`。
+  **对外暴露必须开鉴权**：本项目已内置 **Bearer Token 鉴权 + 令牌桶限流**（§5.6），
+  也可叠加反向代理 / API 网关侧鉴权。
 - SDK 对 `127.0.0.1 / localhost / ::1` 自动开启 DNS rebinding 防护（校验 Host / Origin）；
   绑定 `0.0.0.0` 或用域名访问时，建议在 `config.yaml` 显式配置：
   ```yaml
@@ -243,7 +250,121 @@ HTTP 客户端接入（Cursor / 支持远程 MCP 的客户端）：
 
 **本机实测（2026-10-18）**：`streamable-http` 端到端通过——`initialize` → `tools/list`（2 个工具）→
 `search_knowledge`（LoRA / RAG 命中，领域外问题被阈值过滤）→ `knowledge_base_stats`；
-全量测试 **14 passed**（原 6 + 新增 8），stdlib 行为零回归。
+全量测试 **46 passed**，`stdio` 行为零回归。HTTP 生产化加固见 **§5.6**、容器见 **§5.7**、压测数据见 **§8.4**。
+
+---
+
+### 5.6 HTTP 生产化（鉴权 / 限流 / 健康检查 / 指标）
+
+> 四项能力**全部零额外依赖**：`rag/http_security.py`（纯 ASGI 中间件）+ `rag/metrics.py`（手写 Prometheus 文本）。
+> 为什么不用 SDK 自带的 OAuth `token_verifier`：本场景只需要「一个共享 Token」，自己写的中间件不依赖 Starlette、
+> 可直接单测，也不会碰请求体（不破坏 streamable-http 的 SSE 流式响应）。取舍见 §9。
+
+**能力总览**（都只作用于 HTTP 传输，`stdio` 完全不受影响）：
+
+| 能力 | 怎么开 | 行为 |
+|---|---|---|
+| **Bearer 鉴权** | `server.auth.enabled: true` + `server.auth.token`（或用环境变量 `RAG_MCP_AUTH_TOKEN`，**设了它即自动开鉴权**） | 缺/错 Token → **401** JSON（带 `WWW-Authenticate`） |
+| **令牌桶限流** | `server.rate_limit.rps` > 0（默认 `0` = 关闭） | 按 Token 分桶、匿名按客户端 IP；超限 → **429** + `Retry-After` |
+| **健康检查** | 恒开（无需配置） | `GET /healthz` → 200，**只读快照、绝不触发建索引** |
+| **Prometheus 指标** | 恒开（无需配置） | `GET /metrics` → `text/plain; version=0.0.4` |
+
+配置（`config.yaml`；优先级 **命令行 > 环境变量 > config.yaml > 代码默认值**）：
+
+```yaml
+server:
+  auth:
+    enabled: false         # 打开后 HTTP 请求必须带 Authorization: Bearer <token>
+    token: ""              # 建议留空，改用环境变量 RAG_MCP_AUTH_TOKEN（更安全的密钥外置）
+  rate_limit:
+    rps: 0                 # 令牌桶速率（个/秒）；<=0 = 关闭限流（默认关闭，不打扰本地/压测）
+    burst: 0               # 桶容量（允许的突发量）；<=0 时取 ceil(rps)
+  security_exempt_paths: ["/healthz", "/metrics"]   # 鉴权 / 限流的豁免路径
+```
+
+环境变量覆盖（容器 / CI 常用，**优先级高于 config.yaml**）：
+
+```bash
+# 只设 Token 即自动开启鉴权；再叠加限流
+RAG_MCP_AUTH_TOKEN=please-change-me \
+RAG_MCP_RATE_LIMIT_RPS=20 RAG_MCP_RATE_LIMIT_BURST=40 \
+  .venv\Scripts\python.exe server.py --transport streamable-http --host 0.0.0.0 --port 8000
+```
+
+调用示例（`curl`）：
+
+```bash
+# 1) 健康检查（匿名可访问，不建索引）
+curl -i http://127.0.0.1:8000/healthz
+# HTTP/1.1 200 OK
+# {"status":"ok","index_ready":true,"documents":5,"chunks":5,"version":"0.1.0","uptime_seconds":12.3}
+
+# 2) 指标（匿名可访问）
+curl -i http://127.0.0.1:8000/metrics | head -20
+
+# 3) 不带 Token 调用 MCP 端点 → 401
+curl -i http://127.0.0.1:8000/mcp
+# HTTP/1.1 401 Unauthorized
+# {"error":"unauthorized","detail":"缺少或无效的 Authorization: Bearer <token>"}
+
+# 4) 带上正确 Token → 正常进入 MCP 协议
+curl -i -H "Authorization: Bearer please-change-me" http://127.0.0.1:8000/mcp
+```
+
+> ⚠️ `/healthz` 与 `/metrics` **不鉴权、不限流**（k8s 探针 / Prometheus 抓取器必须能匿名访问，
+> 见 `server.security_exempt_paths`）。若部署到公网，请用反向代理把这两个端点限制在内网/白名单。
+
+**指标清单**（名字与 `rag/metrics.py` 一一对应）：
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `rag_mcp_requests_total{status}` | counter | HTTP 请求总数（按状态码分组，**含 401/429 拒绝**） |
+| `rag_mcp_tool_calls_total{tool}` | counter | 工具调用总数（按工具名分组） |
+| `rag_mcp_errors_total` | counter | 错误总数（HTTP 5xx ＋ 工具内部异常） |
+| `rag_mcp_request_duration_ms{quantile}` | summary | 请求耗时（毫秒）的 p50/p95/p99 估算值 + `_count` / `_sum` |
+| `rag_mcp_auth_failures_total` | counter | 鉴权失败（401）次数 |
+| `rag_mcp_rate_limited_total` | counter | 被限流拒绝（429）次数 |
+| `rag_mcp_uptime_seconds` | gauge | 指标表存活时长（判断是否重启过） |
+
+#### 5.6.1 鉴权为什么这样设计
+
+- **单一共享 Token + `hmac.compare_digest`**：恒定时间比较，避免时序侧信道；Token 用环境变量注入，不落配置文件。
+- **fail fast**：`auth.enabled=true` 却没配 Token → 启动即抛 `ValueError`，**绝不静默放行**（"配了鉴权却没生效" 比"没配鉴权"更危险）。
+- **只挡 HTTP**：`stdio` 是同一台机器上的父子进程，没有网络入口，鉴权无意义，因此不介入。
+
+#### 5.6.2 限流为什么这样设计
+
+- **限流在鉴权之前**：未携带正确 Token 的洪水请求同样吃 CPU（协议解析 / TLS / 日志），先限流才能挡住"拿错误 Token 暴力猜"。
+- **按身份分桶**（有 Token 按 Token，否则按客户端 IP）：单个客户端打满配额**不影响**其他客户端。
+- **令牌桶（惰性补充）**：允许最多 `burst` 个突发，同时把**平均速率**卡在 `rps`；空桶客户端不占后台线程。
+- **默认关闭**（`rps: 0`）：本地开发 / 压测默认不受打扰，生产再显式打开。
+- **单实例内存态**：多副本部署时每个进程各有一套桶（有 N 个副本就近似 N 倍总额度）；需要全局精确限流应放到网关 / Redis。
+  限流桶表有上限（默认 4096 个 key），超出优先淘汰"已回满"的桶（无状态损失）。
+
+### 5.7 Docker 部署
+
+`Dockerfile`：基础镜像 `python:3.12-slim`、**非 root 用户**运行、`EXPOSE 8000`、
+`HEALTHCHECK` 打 `/healthz`、`CMD` 为
+`python server.py --transport streamable-http --host 0.0.0.0 --port 8000`。
+
+```bash
+# 构建
+docker build -t rag-mcp-server:dev .
+
+# 运行（把模型缓存挂出来，避免每次重建镜像都重新下载 BGE 模型）
+docker run --rm -p 8000:8000 \
+  -e RAG_MCP_TRANSPORT=streamable-http \
+  -e RAG_MCP_HOST=0.0.0.0 \
+  -e RAG_MCP_AUTH_TOKEN=please-change-me \
+  -v rag-hf-cache:/home/app/.cache/huggingface \
+  rag-mcp-server:dev
+```
+
+> ⚠️ **Dockerfile 未在本机验证**：开发机未安装 Docker，`Dockerfile` / `.dockerignore` 是按最佳实践编写、
+> **未实际 `docker build` 运行过的**产物，首次构建可能需要按你所在网络环境微调
+> （例如模型需能从 HuggingFace 拉取）。容器内**首次启动要联网下载** `BAAI/bge-small-zh-v1.5`，
+> 因此容器场景下**不要**把 `RAG_MCP_EMBEDDING_OFFLINE` 设为 `true`（那是裸机离线演示用的开关）；
+> 用上面的 `-v` 挂载缓存后，重建镜像不会再下载。
 
 ---
 
@@ -423,7 +544,10 @@ HTTP 客户端接入（Cursor / 支持远程 MCP 的客户端）：
 
 > 复现时如果先去 `tests/` 或 `scripts/smoke_test.py` 跑过一次，`缓存命中` 计数会更大——这是缓存生效的正常表现。
 
-### 8.3 单元测试（`python -m pytest tests -v`）
+### 8.3 单元测试（`python -m pytest tests -v`）—— 历史快照（6 个用例）
+
+> 下面是**项目最初（仅 stdio、6 个用例）**时的原样输出，保留作对照。
+> 当前全量用例已增至 **46 passed**（+ 传输 8 + HTTP 安全 30 + 并发 2），最新数字见 §5.3。
 
 ```text
 platform win32 -- Python 3.12.9, pytest-9.1.1, pluggy-1.7.0 -- .venv\Scripts\python.exe
@@ -441,6 +565,91 @@ tests/test_service.py::test_result_is_json_serializable PASSED           [100%]
 
 测试断言的都是**行为契约**（不是快照）：分数降序、`top_k` 被上限截断、领域外问题必须被过滤且给 `hint`、
 空 query 必须报错、返回值必须可 JSON 序列化。
+
+### 8.4 HTTP 压测（`python scripts\bench_http.py`）
+
+压测脚本用官方 `streamable_http_client` 建立**长连接**（`initialize` 一次、后续复用会话），
+跑多轮「并发数 × 每并发请求数」，输出 **p50 / p95 / p99 / QPS / 错误率**，
+并在结束后对比服务端 `/metrics` 的计数增量做交叉校验（计数器是累计值，故用 delta）。
+
+```bash
+# 单档压测：20 个长连接并发、共 100 次请求（其中前 3 次为预热，不计入统计）
+.venv\Scripts\python.exe scripts\bench_http.py --port 8099 --concurrency 20 --requests 100
+```
+
+> 脚本一次只跑一档；下表的多档数据 = 换个并发/请求数**循环调用**本脚本得到。
+> 加 `--json` 可输出机器可读的一行 JSON，便于脚本化对比；默认还会抓服务端 `/metrics` 做交叉校验。
+
+**本机实测（2026-10-19，Windows / Python 3.12.9 / CPU / 单 uvicorn worker）**：
+
+| 并发 × 次数 | QPS | p50 (ms) | p95 (ms) | p99 (ms) | 错误率 |
+|---|---|---|---|---|---|
+| 1 × 20 | 212.8 | 4.29 | 5.46 | 5.68 | 0% |
+| 10 × 100 | **285.6** | 29.7 | 64.1 | 66.6 | 0% |
+| 20 × 100 | 256.9 | 60.6 | 110.3 | 113.5 | 0% |
+| 50 × 500 | 270.5 | 149.6 | 310.6 | 318.1 | 0% |
+| 100 × 200 | 162.5 | 376.8 | 629.3 | 659.7 | 0% |
+
+（`100 × 200` 为 3 次运行的中位数。）
+
+**复核用（本机最近一次，命令即上面的单档命令）**：`20 并发 × 100 请求` →
+**QPS 210.2 / p50 64.6 / p95 162.3 / p99 174.4 ms / 错误率 0.00%**（max 177.5，mean 83.7）；
+服务端 `/metrics` 交叉校验：`tool_calls_total{search_knowledge}` 增量 **160 == 客户端 160 次**（100 正式 + 20 客户端 × 3 预热），
+`errors_total` / `rate_limited_total` / `auth_failures_total` 增量均为 **0**。
+（与上表同为 `20 × 100` 档，p50 64.6 vs 60.6、p95 162.3 vs 110.3 —— 差异即文末所述的本机波动。）
+
+**怎么读这张表**：
+
+- **QPS 在并发 10 附近见顶（~285）**，之后随并发上升而**下降**：检索是 CPU 密集型（NumPy 矩阵乘 + MD5 缓存查表），
+  uvicorn 单 worker 受 GIL 约束——并发越高，排队时间越长，p99 从 5.7ms 涨到 318ms；到 100 并发时排队成本已超过并行收益。
+  要更高吞吐应加 worker / 多副本（本服务无状态化后可用 `--stateless`）。
+- **1×20 那行的 p50 只有 4.29ms**：这才是「单次检索的净延迟」（query 命中 MD5 缓存），
+  其余行里的 p95/p99 主要是**排队时间**，不是检索本身变慢。
+- **全轮 0 错误**，服务端 `/metrics` 的 `errors_total` 增量为 **0**，26 个缓存文件全部可读、无 `.tmp` 残留。
+
+`/metrics` 示例输出（结构与取值取自 `50×500` 那轮，`_sum` 为示例值）：
+
+```text
+# HELP rag_mcp_requests_total HTTP 请求总数（按响应状态码分组）
+# TYPE rag_mcp_requests_total counter
+rag_mcp_requests_total{status="200"} 20012
+# HELP rag_mcp_tool_calls_total MCP 工具调用总数（按工具名分组）
+# TYPE rag_mcp_tool_calls_total counter
+rag_mcp_tool_calls_total{tool="search_knowledge"} 20000
+# HELP rag_mcp_errors_total 错误总数（HTTP 5xx 响应 + 工具内部异常）
+# TYPE rag_mcp_errors_total counter
+rag_mcp_errors_total 0
+# HELP rag_mcp_request_duration_ms HTTP 请求耗时摘要（毫秒；分位数为最近采样的估算值）
+# TYPE rag_mcp_request_duration_ms summary
+rag_mcp_request_duration_ms{quantile="0.5"} 149.6
+rag_mcp_request_duration_ms{quantile="0.95"} 310.6
+rag_mcp_request_duration_ms{quantile="0.99"} 318.1
+rag_mcp_request_duration_ms_count 20012
+rag_mcp_request_duration_ms_sum 3012345.678
+# HELP rag_mcp_auth_failures_total 鉴权失败（401）次数
+# TYPE rag_mcp_auth_failures_total counter
+rag_mcp_auth_failures_total 0
+# HELP rag_mcp_rate_limited_total 被令牌桶限流拒绝（429）的次数
+# TYPE rag_mcp_rate_limited_total counter
+rag_mcp_rate_limited_total 0
+# HELP rag_mcp_uptime_seconds 指标表存活时长（秒）
+# TYPE rag_mcp_uptime_seconds gauge
+rag_mcp_uptime_seconds 96.421
+```
+
+**压测顺便挖出并修掉的一个真实并发 Bug**（值得面试讲）：20 并发 + **冷缓存**时，
+多个请求同时算完向量、同时写同一个 `*.npy`，导致后写者截断先写者，服务端报：
+
+```text
+Failed to read all data for array. Expected (1, 512) = 512 elements, could only read 0 elements. (file seems not fully written?)
+```
+
+修法：① 同 key **单飞锁**（同一文本只算一次向量）；② 缓存**先写临时文件、再 `os.replace` 原子替换**；
+③ 读取端**自愈**（shape 校验，损坏即当 miss 重算）。修复后冷缓存 50 并发重跑，26/26 缓存文件可读、0 错误。
+
+**压测数据的可信度说明**：同一配置跨轮次 QPS 波动可达 ±30%（Windows 本机、CPU 推理、其它进程干扰），
+所以上表用「并发档位」看**趋势**，不要当绝对性能承诺；关键结论是**QPS 拐点出现在 10 并发附近**、
+以及**全程无误码**。
 
 ---
 
@@ -460,6 +669,13 @@ tests/test_service.py::test_result_is_json_serializable PASSED           [100%]
 | **`device: auto` + `offline: true`** | 有 GPU 用 GPU、没有就 CPU；模型缓存后完全离线可复现 | 换台机器就要改配置/联网，演示时容易翻车 |
 | **忘记 `similarity_threshold` 为什么是 0.3** | 与同源平台保持一致口径；它在样例集上能过滤掉领域外问题（见探针 3），属于经验值 | —— |
 | **只用 NumPy 暴力检索** | 几十~几百 chunk 规模下矩阵乘法不是瓶颈，换来零依赖、行为完全可解释 | 引入向量库会多一层运维与调试成本，收益在万级 chunk 才显现 |
+| **鉴权自写纯 ASGI 中间件（不用 SDK OAuth）** | 本场景只需一个共享 Token；OAuth 那一套（授权服务器元数据/动态注册）复杂度与收益不成比例；自写中间件不依赖 Starlette，可脱离框架单测，且不碰请求体（不破坏 SSE 流式响应） | 上 SDK OAuth 要配一堆元数据端点，且难在无框架下单测 |
+| **指标零依赖手写 Prometheus 文本（不用 `prometheus_client`）** | 只需 4 类指标，几十行就能算清；**指标不应该成为故障源**——多一个运行时依赖就多一种启动失败可能 | 指标库版本冲突会导致整个服务起不来（可观测性反而制造不可用） |
+| **限流放在鉴权之前、按身份分桶** | 未带正确 Token 的洪水同样吃 CPU，先限流才挡得住"暴力猜 Token"；按 Token/IP 分桶让合法客户端不被别人拖累 | 先鉴权则匿名洪水直冲协议解析；全局单桶则一人打满全体挨饿 |
+| **限流默认关闭（`rps: 0`）** | 本地开发 / 压测 / 单测不该被限流打扰，生产再显式打开 | 默认开限流会误伤正常的批量客户端与压测，排障时易误判为服务故障 |
+| **`/healthz` 只读、绝不触发建索引** | 探针应如实反映"服务是否可用"，而不是顺手把 5s 建索引塞进一次探针请求 | 探针触发建索引 → 超时判定为不健康 → 容器被反复重启（雪崩） |
+| **缓存写入原子化（tmp + `os.replace`）+ 单飞锁 + 读取自愈** | 冷缓存并发下多个请求会同时写同一 `.npy`；并发 bug 是压测暴露的（§8.4），修完才 0 错误 | 半截文件导致随机读取失败、报错难复现（"file seems not fully written"） |
+| **Dockerfile 非 root + `HEALTHCHECK` 打 `/healthz`** | 最小权限运行；健康检查走已内置的只读端点，编排层能自愈 | 以 root 跑容器、又无健康检查，等于放弃容器编排最基本的两道防线 |
 
 ### MCP 协议版本说明（踩过的坑，如实记录）
 
@@ -477,23 +693,29 @@ tests/test_service.py::test_result_is_json_serializable PASSED           [100%]
 
 ```text
 rag-mcp-server/
-├── server.py                  # MCP Server 入口（stdio / streamable-http / sse）：工具定义 + 预热 + 日志纪律
-├── config.yaml                # 知识库路径 / 切分 / embedding / 检索 / 传输（host/port/path）
-├── requirements.txt           # 固定版本依赖（实测通过）
+├── server.py                  # MCP Server 入口（stdio / streamable-http / sse）：工具定义 + 预热 + /healthz + /metrics
+├── config.yaml                # 知识库 / 切分 / embedding / 检索 / 传输 / 安全层（auth / rate_limit / 豁免路径）
+├── requirements.txt           # 固定版本依赖（实测通过；HTTP 生产化未新增任何依赖）
+├── Dockerfile                 # 容器镜像（python:3.12-slim、非 root、EXPOSE 8000、HEALTHCHECK /healthz）※未本机验证
+├── .dockerignore              # 构建上下文排除项（.venv / 缓存 / 测试 / 运行产物）
 ├── rag/
 │   ├── config.py              # 配置加载：默认值合并 + 相对路径解析 + 环境变量覆盖 + device 自动探测
 │   ├── logging_utils.py       # 日志统一写 stderr（保住 stdout 给协议）
 │   ├── chunking.py            # 固定窗口切分（最小移植）
-│   ├── embedding.py           # BGE-small-zh-v1.5 + 文本 MD5 缓存 + 离线开关
+│   ├── embedding.py           # BGE-small-zh-v1.5 + 文本 MD5 缓存（原子写 + 单飞锁）+ 离线开关
 │   ├── retrieval.py           # 余弦相似度 + 阈值过滤 + top_k 上限
-│   └── service.py             # KnowledgeService：加载 → 建索引 → 检索（进程级单例）
+│   ├── http_security.py       # HTTP 安全层：Bearer 鉴权 + 令牌桶限流（纯 ASGI 中间件，零依赖）
+│   ├── metrics.py             # 进程内指标 + Prometheus 文本导出（手写、零依赖、线程安全）
+│   └── service.py             # KnowledgeService：加载 → 建索引（单飞锁）→ 检索（进程级单例）
 ├── scripts/
 │   ├── smoke_test.py          # 冒烟：不经协议，直接验证检索链路（含领域外问题探针）
 │   ├── mcp_client_demo.py     # 端到端：官方 MCP 客户端 stdio 调用（含 tools/list）
-│   └── mcp_http_client_demo.py# 端到端：连接已运行的 HTTP Server（streamable-http / sse）
+│   ├── mcp_http_client_demo.py# 端到端：连接已运行的 HTTP Server（streamable-http / sse）
+│   └── bench_http.py          # HTTP 压测：长连接、并发×轮次，输出 p50/p95/p99/QPS/错误率
 ├── tests/
-│   ├── test_service.py        # 6 个检索行为契约测试
-│   └── test_http_transport.py # 8 个传输测试（参数映射 + Streamable HTTP 端到端）
+│   ├── test_service.py        # 8 个检索行为契约 + 并发（原子写缓存 / 索引只建一次）测试
+│   ├── test_http_transport.py # 8 个传输测试（参数映射 + Streamable HTTP 端到端）
+│   └── test_http_security.py  # 30 个安全测试（401/429/healthz/metrics + 子进程端到端）
 └── data/sample/
     └── knowledge_base.json    # 示例知识库（5 篇中文技术短文，与 rag-eval-platform 同源同文件）
 ```
@@ -509,11 +731,23 @@ rag-mcp-server/
   因此**无法给出 Recall@K 之类的正式指标**；本项目只对「行为契约」做了测试。
   检索效果的正式评测在 [rag-eval-platform](../rag-eval-platform) 侧（三层指标 + 真实实验数据）。
 - **切分策略**：只移植了固定窗口切分；原平台的 recursive / semantic 未移植。
-- **传输模式**：已支持 `stdio` / `streamable-http` / `sse` 三种；本地已端到端验证，
-  但**未做压测、未验证反向代理/多实例会话粘滞**等生产级场景。
-- **鉴权**：stdio 是本机子进程模式，无鉴权；HTTP 模式默认只绑 `127.0.0.1`。
-  对外提供服务时必须另行加鉴权（MCP OAuth / token verifier）与限流，
+- **传输模式**：已支持 `stdio` / `streamable-http` / `sse` 三种；本地已端到端验证并**做了压测（§8.4）**。
+  但仍**未验证反向代理 / TLS 终止 / 多实例会话粘滞**等生产级场景；多副本部署需配合 `--stateless`。
+- **鉴权**：`stdio` 是本机子进程模式，无鉴权；HTTP 已内置 **Bearer Token 鉴权 + 令牌桶限流**（§5.6）。
+  但**默认是关闭的**（`auth.enabled=false` / `rate_limit.rps=0`），且**只有单一共享 Token**——
+  没有多租户、没有 Token 轮转/吊销、没有按用户配额。对外提供服务时请务必显式开启，并叠加反向代理 / 网关侧防护，
   **不要**把无鉴权的检索服务直接暴露到公网。
+- **限流是单实例内存态**：多副本部署时每个进程各有一套令牌桶（近似 N 倍总额度），计数器也不跨进程聚合；
+  需要全局精确限流 / 聚合指标，应放到网关、边车或 Redis。
+- **限流按客户端 IP 时不解析 `X-Forwarded-For`**：若前面有反向代理，看到的是代理 IP，
+  所有匿名客户端会共用一个桶——此时应改用 Token 身份，或让网关限流。
+- **`/healthz`、`/metrics` 不鉴权**：容器探针 / Prometheus 需要匿名访问是刻意设计；
+  若暴露公网，请用反向代理把这两个端点限制在内网。
+- **压测数据的可信度**：本机（Windows / CPU 推理）同一配置跨轮 QPS 波动可达 ±30%，§8.4 的表用于看**趋势**，
+  不是绝对性能承诺。
+- **Dockerfile 未在本机验证**：开发机无 Docker，镜像**未实际构建运行**（详见 §5.7）。
+- **Windows 上客户端中断会打日志**：压测/客户端提前断开时可能出现 `ConnectionResetError` 之类的堆栈噪音，
+  来自 uvicorn/asyncio 层，**不影响服务正确性**（后续请求照常），故未特殊屏蔽。
 
 ## License
 
