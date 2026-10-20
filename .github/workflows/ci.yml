@@ -38,7 +38,11 @@ jobs:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
       NO_PROXY: "127.0.0.1,localhost"
-      no_proxy: "127.0.0.1,localhost"
+      # ★ 只保留大写的 NO_PROXY：**不能同时写 no_proxy**——
+      #   GitHub Actions 的校验把「只差大小写的 env 键」当重复键，
+      #   会把**整个 workflow 文件**判为无效（run 在 job 起来前就失败，
+      #   且不可重跑）。2026-10-21 实测：两个都写 → 文件无效；只留一个 → 正常。
+      #   （Windows runner 的环境变量名不区分大小写。）
       PYTHONIOENCODING: "utf-8"
       PYTHONDONTWRITEBYTECODE: "1"
 
