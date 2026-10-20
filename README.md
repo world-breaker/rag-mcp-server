@@ -509,7 +509,7 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs \
 # 本机实测（Windows / Python 3.12.9），三种情形各跑一次：
 # ① 门禁命令 + 本机有 HF 缓存：        126 passed, 13 deselected in 5.36s
 # ② 门禁命令 + HF 缓存清空（= runner）：126 passed, 13 deselected in 3.74s（HF_HOME 指空目录实测）
-# ③ 对照组：不清缓存但**不排除**这 13 个用例 → 3 failed, 124 passed, 10 errors（全是"拉不到模型"）
+# ③ 对照组：不清缓存但**不排除**这 13 个用例 → 3 failed, 126 passed, 10 errors（全是"拉不到模型"）
 #    —— 这样才知道要排除的恰好是 13 个，而不是"随手挑了几个让它变绿"
 # ④ 全量（有缓存、无排除）：139 passed in 89.49s（命令见 §5.3）
 ```
