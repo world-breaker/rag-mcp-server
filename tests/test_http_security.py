@@ -342,9 +342,13 @@ def test_metrics_render_contains_all_required_metrics():
     assert 'rag_mcp_tool_calls_total{tool="search_knowledge"} 2' in text
     assert 'rag_mcp_tool_calls_total{tool="knowledge_base_stats"} 1' in text
     assert "rag_mcp_errors_total 2" in text
-    assert 'rag_mcp_request_duration_ms{quantile="0.5"}' in text
-    assert 'rag_mcp_request_duration_ms{quantile="0.95"}' in text
-    assert 'rag_mcp_request_duration_ms{quantile="0.99"}' in text
+    # 耗时指标是直方图（桶计数单调）；滑动窗口分位数另起名字，避免被当成 summary 用
+    assert "# TYPE rag_mcp_request_duration_ms histogram" in text
+    assert 'rag_mcp_request_duration_ms_bucket{le="+Inf"} 3' in text
+    assert "# TYPE rag_mcp_request_duration_ms_recent untyped" in text
+    assert 'rag_mcp_request_duration_ms_recent{quantile="0.5"}' in text
+    assert 'rag_mcp_request_duration_ms_recent{quantile="0.95"}' in text
+    assert 'rag_mcp_request_duration_ms_recent{quantile="0.99"}' in text
     assert "rag_mcp_request_duration_ms_count 3" in text
     assert "rag_mcp_request_duration_ms_sum 43.0" in text
     assert "rag_mcp_uptime_seconds" in text

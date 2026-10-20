@@ -1,18 +1,28 @@
-"""向量化：BGE-small-zh-v1.5 + 文本 MD5 内容缓存（最小移植版）。
+"""向量化：BGE-small-zh-v1.5 + （模型名+文本）MD5 内容缓存（最小移植版）。
 
 与 rag-eval-platform 的差异：
 - device 支持 "auto"（有 CUDA 用 GPU，否则 CPU），原平台写死单一设备；
 - 新增 offline 开关与缓存命中计数（供 stats 工具展示）；
-- 缓存键算法、归一化方式、模型与维度与原平台完全一致，两个仓库产出的向量可互换。
+- 归一化方式、模型与维度与原平台完全一致，两个仓库产出的向量可互换；
+- **缓存键比原平台多带一个模型名**（见下），因此两边的缓存文件**不通用**（向量通用、缓存不通用）；
 - 缓存读写加了**并发保护**（原子落盘 + 同 key 单飞 + 坏文件自愈）：
   HTTP 传输下工具函数由 SDK 放在线程池里执行（`anyio.to_thread.run_sync`），
   并发冷启动时会多线程同时写同一个 `.npy` —— 压测实测会写出半截文件
   （`Failed to read all data for array ... file seems not fully written?`），
   stdio 单客户端模式下永远碰不到这个问题。
+
+## 缓存键为什么必须带模型名
+
+缓存里存的是「**某个模型**算出来的向量」。如果缓存键只按文本取（早期实现），
+那么改掉 `embedding.model_name` 之后旧缓存**照样命中** —— 拿回来的是**旧模型**的向量，
+但检索结果/指标看上去「一切正常」。这是典型的**静默污染**：实验数字看着对，
+实际跑的是另一个模型。带上映射模型名之后，换模型 = 换键 = 缓存自动失效并重算
+（代价只是第一次重算一遍向量，见 README §5.9）。
 """
 
 import hashlib
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -29,11 +39,30 @@ logger = get_logger()
 #: 不会破坏正确性，因此这里用最简单的方式给内存封顶
 MAX_KEY_LOCKS = 4096
 
+#: 模型名 → 文件名安全短标识：只保留这些字符，其余换成 "_"
+_MODEL_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def model_slug(model_name: str) -> str:
+    """把模型名变成文件名安全的短标识（'BAAI/bge-small-zh-v1.5' → 'BAAI_bge-small-zh-v1.5'）。
+
+    只为让缓存文件名**人可读**（一眼看出是哪份模型的向量）；
+    真正决定缓存身份的是 `md5(模型名 + 文本)`，所以两个不同模型即使 slug 撞了也不会互相污染。
+    """
+    slug = _MODEL_SLUG_RE.sub("_", str(model_name)).strip("_")
+    if not slug:
+        slug = "model"
+    return slug[:40]
+
 
 class EmbeddingEngine:
-    """向量化引擎：模型封装 + 基于文本 MD5 的离线缓存（文档不变不重算）。"""
+    """向量化引擎：模型封装 + 基于（模型名+文本）MD5 的离线缓存（文档不变不重算）。"""
 
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, model=None):
+        """`model` 可注入一个已加载好的编码器（单测用假模型即可，不必下载 BGE）。
+
+        生产路径不传 `model`：照常按 `embedding.model_name` 加载 SentenceTransformer。
+        """
         emb_cfg = config["embedding"]
         self.model_name = emb_cfg["model_name"]
         self.device = resolve_device(config)
@@ -54,6 +83,12 @@ class EmbeddingEngine:
             os.environ.setdefault("HF_HUB_OFFLINE", "1")
             os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
+        if model is not None:
+            # 单测注入：让「缓存键隔离」这类用例离线可跑（CI runner 上没有 BGE 缓存）
+            self.model = model
+            logger.info(f"Embedding 模型由调用方注入：{self.model_name}")
+            return
+
         # 延迟导入：只有真正要算向量时才付模型加载的代价
         from sentence_transformers import SentenceTransformer
 
@@ -69,11 +104,24 @@ class EmbeddingEngine:
         dimension = getattr(self.model, "get_embedding_dimension", None) or self.model.get_sentence_embedding_dimension
         logger.info(f"模型加载完成，向量维度：{dimension()}")
 
-    @staticmethod
-    def _hash_texts(texts: List[str]) -> str:
-        """缓存键：所有文本按顺序拼接后取 MD5（顺序不同 = 不同键，避免错配）。"""
-        joined = "|||".join(texts)
-        return hashlib.md5(joined.encode("utf-8")).hexdigest()
+    # ========== 缓存键 ==========
+
+    def _cache_key(self, texts: List[str]) -> str:
+        """缓存键：**模型名 + 文本内容**的 MD5。
+
+        为什么必须带模型名：缓存里存的是「某个模型算出来的向量」。
+        早期实现只按文本取键，改了 `embedding.model_name` 之后旧缓存照样命中 ——
+        拿回来的是**旧模型**的向量，指标却看着「正常」（静默污染）。
+        带上模型名之后：换模型 = 换键 = 旧缓存自动失效并重算。
+
+        文本之间用 "|||" 拼接（顺序不同 = 不同键，避免错配）。
+        """
+        payload = f"{self.model_name}\n" + "|||".join(texts)
+        return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+    def _cache_path(self, texts: List[str]) -> Path:
+        """缓存文件路径：`<模型标识>-<内容哈希>.npy`（模型标识让人一眼看出是哪份模型的向量）。"""
+        return self.cache_dir / f"{model_slug(self.model_name)}-{self._cache_key(texts)}.npy"
 
     # ========== 缓存读写（并发安全） ==========
 
@@ -146,8 +194,8 @@ class EmbeddingEngine:
     def encode(self, chunks: List[Dict]) -> np.ndarray:
         """把 chunk 列表转成向量矩阵；命中缓存则跳过模型计算。"""
         texts = [c["text"] for c in chunks]
-        cache_key = self._hash_texts(texts)
-        cache_path = self.cache_dir / f"{cache_key}.npy"
+        cache_key = self._cache_key(texts)
+        cache_path = self._cache_path(texts)
 
         cached = self._load_cache(cache_path, expected_rows=len(texts))
         if cached is not None:
@@ -164,7 +212,7 @@ class EmbeddingEngine:
                 return cached
 
             self._count("cache_misses")
-            logger.info(f"计算 Embedding：{len(texts)} 条文本")
+            logger.info(f"计算 Embedding：{len(texts)} 条文本（模型={self.model_name}）")
             embeddings = self.model.encode(
                 texts,
                 batch_size=self.batch_size,

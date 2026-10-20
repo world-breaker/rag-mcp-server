@@ -9,7 +9,7 @@
 #
 #   「未验证」到什么程度，划清楚（本文件能静态取证的都取证了，动态的一件没验）：
 #   - 已静态取证（可重复跑：.venv\Scripts\python.exe scripts/check_dockerfile_consistency.py，
-#     26 项全过；另有 hadolint 2.12.0 静态检查 0 告警）：
+#     29 项全过；另有 hadolint 2.12.0 静态检查 0 告警）：
 #       · CMD 的每个选项/取值都真在 server.py 的 argparse 里（不是照着文档抄的）；
 #       · ENV 里的 RAG_MCP_* 都真被 rag/config.py 读取，且与 config.yaml 的端口一致；
 #       · /healthz 真的用 @server.custom_route 注册、返回体真的有一级字段 index_ready、确实在

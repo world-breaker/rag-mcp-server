@@ -3,7 +3,9 @@
 与 rag-eval-platform 的差异：
 - 原平台有 fixed_size / recursive / semantic 三种策略；本仓库只移植 fixed_size
   （平台默认策略），因为 MCP Server 的定位是「检索能力对外暴露」，
-  切分策略对比是评测平台的职责。策略字段保留在配置里，便于以后扩展。
+  切分策略对比是评测平台的职责。策略字段保留在配置里，便于以后扩展
+  —— 但**写了没实现的策略会在启动时报错**（见 `rag/config.py` 的 `_validate_config`），
+  不做「配了却静默按 fixed_size 跑」的静默失效。
 """
 
 from typing import Dict, List
@@ -11,6 +13,9 @@ from typing import Dict, List
 from rag.logging_utils import get_logger
 
 logger = get_logger()
+
+#: 本切分器支持的策略名（与 rag/config.py 的白名单一致）
+SUPPORTED_STRATEGY = "fixed_size"
 
 
 class FixedSizeChunker:
@@ -22,6 +27,12 @@ class FixedSizeChunker:
 
     def __init__(self, config: Dict):
         chunk_cfg = config["chunking"]
+        # 双保险：配置是手工拼出来的（绕过 load_config）也不允许「配了 semantic 却按 fixed 跑」
+        strategy = str(chunk_cfg.get("strategy", SUPPORTED_STRATEGY)).strip().lower()
+        if strategy != SUPPORTED_STRATEGY:
+            raise ValueError(
+                f"FixedSizeChunker 只支持 chunking.strategy={SUPPORTED_STRATEGY}，当前为 {strategy!r}"
+            )
         self.chunk_size = int(chunk_cfg["chunk_size"])
         self.chunk_overlap = int(chunk_cfg["chunk_overlap"])
         if self.chunk_overlap >= self.chunk_size:

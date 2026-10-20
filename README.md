@@ -6,7 +6,7 @@
 
 - 工具 1：`search_knowledge(query, top_k=3)` → 返回最相关片段 + 相似度分数（JSON）
 - 工具 2：`knowledge_base_stats()` → 返回索引元信息（文档数 / chunk 数 / 模型 / 阈值 / 缓存命中）
-- 检索实现：BGE-small-zh-v1.5 向量（512 维）+ NumPy 余弦相似度 + 阈值过滤 + 文本 MD5 缓存
+- 检索实现：BGE-small-zh-v1.5 向量（512 维）+ NumPy 余弦相似度 + 阈值过滤 + （模型名+文本）MD5 缓存
 - HTTP 生产化（§5.6）：Bearer 鉴权、令牌桶限流、`/healthz`、Prometheus `/metrics`（零额外依赖）、
   Dockerfile、压测脚本 `scripts/bench_http.py`（本机实测 ~250 QPS / p99 ~113ms，0 错误）
 - 提示注入（间接注入）防护（§7）：检索结果结构化为不可信数据 + 可疑模式标注/中和 + `security` 开关 +
@@ -55,7 +55,7 @@ flowchart LR
         T1["tool: search_knowledge<br/>query, top_k"]
         T2["tool: knowledge_base_stats"]
         SVC["KnowledgeService（进程级单例）<br/>索引只构建一次"]
-        EMB["EmbeddingEngine<br/>BGE-small-zh-v1.5 + MD5 缓存"]
+        EMB["EmbeddingEngine<br/>BGE-small-zh-v1.5 + （模型名+文本）MD5 缓存"]
         RET["RetrievalEngine<br/>余弦相似度 + 阈值过滤 + top_k 上限"]
         CFG["config.yaml"]
     end
@@ -81,7 +81,7 @@ flowchart LR
 1. 客户端通过 stdin 发送 `tools/call` 报文（JSON-RPC）；
 2. Server 进程里的 `search_knowledge` 被调用 → 交给 `KnowledgeService`；
 3. `KnowledgeService` 把 query 交给 `EmbeddingEngine` 编码成 512 维向量
-   （**query 也走 MD5 缓存**：同一问题重复问不重算）；
+   （**query 也走缓存**：同一问题重复问不重算；缓存键含模型名，换模型自动重算，见 §5.9）；
 4. `RetrievalEngine` 用归一化向量的点积等价计算余弦相似度，取 Top-K，**丢弃低于阈值的候选**；
 5. 组装成 JSON（含 `rank/score/source/chunk_index/text` 与 `filtered_by_threshold`），
    经 stdout 返回给客户端。
@@ -96,7 +96,7 @@ flowchart LR
 |---|---|---|---|
 | 定位 | RAG **实验/评测**平台（切分 → 生成 → 三层指标） | RAG 检索的 **MCP 服务化** | 一个做实验，一个做能力输出 |
 | 切分 | 3 种策略（fixed_size / recursive / semantic） | **只保留 fixed_size** | 策略对比是评测平台的职责；配置项保留，便于扩展 |
-| Embedding | BGE-small-zh-v1.5，文本 MD5 缓存 | **同**（同一模型、同一缓存键算法、同一归一化方式） | 两个仓库产出的向量可互换 |
+| Embedding | BGE-small-zh-v1.5，文本 MD5 缓存 | **同**（同一模型、同一归一化方式、同一维度）；**缓存键多带一个模型名**（见 §5.9） | 两个仓库产出的向量可互换；**缓存文件不通用**（键不同，各自算各自的） |
 | 检索 | NumPy 余弦 + 阈值过滤 | **同**，额外返回 `filtered_by_threshold` | 让调用方能区分「库里没有」与「分数被过滤」 |
 | 生成 | Qwen2.5 / OpenAI 兼容 API | **无** | 本项目不接 LLM：Server 只负责「给证据」 |
 | 评测 | Recall/Precision/MRR + LLM-as-Judge + BLEU/ROUGE | 无（仅 pytest 行为断言） | 指标评测留在评测平台 |
@@ -111,6 +111,9 @@ flowchart LR
 knowledge_base:
   path: "../rag-eval-platform/data/sample/knowledge_base.json"
 ```
+
+> 也可以用环境变量 `RAG_MCP_KB_PATH` 临时指定知识库路径（**优先级高于 `config.yaml`**，
+> 容器里挂载知识库、测试时指向对抗语料都用得上）：`RAG_MCP_KB_PATH=/data/kb.json python server.py`。
 
 ---
 
@@ -160,9 +163,12 @@ pip install -r requirements.txt
 .venv\Scripts\python.exe -m pytest tests -v
 ```
 
-> 本机实测 **117 passed**：检索行为契约 8（`test_service.py`）＋ 传输 8（`test_http_transport.py`）
+> 本机实测 **137 passed**：检索行为契约 8（`test_service.py`）＋ 传输 8（`test_http_transport.py`）
 > ＋ HTTP 安全 30（`test_http_security.py`，含 1 个子进程端到端用例）
-> ＋ 提示注入防护 71（`test_prompt_injection.py`，含 1 个真实 HTTP 端到端用例）。
+> ＋ 提示注入防护 71（`test_prompt_injection.py`，含 1 个真实 HTTP 端到端用例）
+> ＋ 缓存键隔离 8（`test_embedding_cache.py`）＋ 配置 fail-fast 6（`test_config.py`）
+> ＋ 指标直方图语义 6（`test_metrics.py`）。
+> 后三组**不需要真实 BGE 模型**（缓存用例注入假模型、其余是纯函数），因此 CI 离线也能跑。
 > ⚠️ 跑 HTTP 相关用例前若本机挂了全局代理，先设 `NO_PROXY=127.0.0.1,localhost`——
 > 否则对 `127.0.0.1` 的请求会被代理转发，回一个与预期不符的 502。
 
@@ -253,7 +259,7 @@ HTTP 客户端接入（Cursor / 支持远程 MCP 的客户端）：
 
 **本机实测（2026-10-18）**：`streamable-http` 端到端通过——`initialize` → `tools/list`（2 个工具）→
 `search_knowledge`（LoRA / RAG 命中，领域外问题被阈值过滤）→ `knowledge_base_stats`；
-全量测试 **117 passed**，`stdio` 行为零回归。HTTP 生产化加固见 **§5.6**、容器见 **§5.7**、压测数据见 **§9.4**。
+全量测试 **137 passed**，`stdio` 行为零回归。HTTP 生产化加固见 **§5.6**、容器见 **§5.7**、压测数据见 **§9.4**。
 
 ---
 
@@ -324,7 +330,8 @@ curl -i -H "Authorization: Bearer please-change-me" http://127.0.0.1:8000/mcp
 | `rag_mcp_requests_total{status}` | counter | HTTP 请求总数（按状态码分组，**含 401/429 拒绝**） |
 | `rag_mcp_tool_calls_total{tool}` | counter | 工具调用总数（按工具名分组） |
 | `rag_mcp_errors_total` | counter | 错误总数（HTTP 5xx ＋ 工具内部异常） |
-| `rag_mcp_request_duration_ms{quantile}` | summary | 请求耗时（毫秒）的 p50/p95/p99 估算值 + `_count` / `_sum` |
+| `rag_mcp_request_duration_ms` | histogram | 请求耗时（毫秒）直方图：`_bucket{le="…"}` 累计桶计数 + `_sum` / `_count`（**单调计数器**） |
+| `rag_mcp_request_duration_ms_recent{quantile}` | untyped | 最近 N 次采样的 p50/p95/p99（**滑动窗口**，值会随时间下降，**只供人看**；做面板请用上面的直方图） |
 | `rag_mcp_auth_failures_total` | counter | 鉴权失败（401）次数 |
 | `rag_mcp_rate_limited_total` | counter | 被限流拒绝（429）次数 |
 | `rag_mcp_prompt_injection_findings_total{rule}` | counter | 检索结果里命中的提示注入可疑模式次数（按规则 id 分组，见 §7） |
@@ -345,6 +352,26 @@ curl -i -H "Authorization: Bearer please-change-me" http://127.0.0.1:8000/mcp
 - **单实例内存态**：多副本部署时每个进程各有一套桶（有 N 个副本就近似 N 倍总额度）；需要全局精确限流应放到网关 / Redis。
   限流桶表有上限（默认 4096 个 key），超出优先淘汰"已回满"的桶（无状态损失）。
 
+#### 5.6.3 耗时指标为什么是 histogram（而不是 summary）
+
+**旧实现有个真 bug**：耗时被声明成 Prometheus `summary`，但分位数取自**最近 2048 次采样的滑动窗口**。
+这两件事语义冲突——summary 的定义是「对进程启动以来的**全部**观测求分位数」，`_sum`/`_count` 是单调计数器；
+而滑动窗口里的分位数**会随时间下降**（慢请求滑出窗口后 p99 会变小），
+拿 `rate()` 去做面板会算出误导性的数字。
+
+现在的口径（两个指标并存，职责分开）：
+
+| 指标 | 类型 | 语义 | 怎么用 |
+|---|---|---|---|
+| `rag_mcp_request_duration_ms` | **histogram** | 桶计数**只增不减**（单调），`_sum`/`_count` 名字与语义都不变 | `histogram_quantile(0.95, rate(rag_mcp_request_duration_ms_bucket[5m]))`（标准写法，可跨实例聚合） |
+| `rag_mcp_request_duration_ms_recent{quantile}` | **untyped** | 最近 N 次采样的 p50/p95/p99，**滑动窗口**、值会下降 | 只供人看（`curl /metrics` 一眼看出当前延迟）；**不要**拿它做面板 |
+
+**取舍说明**：`rate(rag_mcp_request_duration_ms_count[5m])` / `..._sum[...]` 这类既有消费方
+**完全不受影响**（名字与单调语义都保住了）；变的只有 `quantile="…"` 那三条 series ——
+它们搬家到了 `_recent` 并改了类型（从 `summary` 变成 `untyped`，因为它本来就不是累计量）。
+用直方图换来的是「桶计数可跨实例聚合 + 标准 `histogram_quantile()`」，这是 summary 给不了的。
+桶边界见 `rag/metrics.py` 的 `DEFAULT_DURATION_BUCKETS`（1ms~10s，共 13 档）。
+
 ### 5.7 Docker 部署
 
 `Dockerfile`：基础镜像 `python:3.12-slim`、**非 root 用户**运行、`EXPOSE 8000`、
@@ -359,7 +386,7 @@ docker build -t rag-mcp-server:dev .
 > ⚠️ **Dockerfile 未在本机验证**：开发机没装 Docker，`docker build` / `docker run` **一次都没跑过**，
 > `Dockerfile` / `.dockerignore` 是按最佳实践写的「待验证」产物；首次构建可能需要按你所在网络环境微调。
 > **「未验证」的边界说清楚**：能静态核对的每一项都已取证、且可重复跑——
-> `.venv\Scripts\python.exe scripts/check_dockerfile_consistency.py`（26 项：CMD 的选项/取值真在 argparse 里、
+> `.venv\Scripts\python.exe scripts/check_dockerfile_consistency.py`（29 项：CMD 的选项/取值真在 argparse 里、
 > ENV 的 `RAG_MCP_*` 真被 `rag/config.py` 读取、端口在四个地方一致、`/healthz` 真注册且真返回 `index_ready`、
 > 全部第三方 import 都被 requirements 覆盖、COPY 路径存在、`.dockerignore` 没误伤）＋ `hadolint Dockerfile`（0 告警）。
 > **仍未验证**的：build 能否成功、run 能否起服务、`HEALTHCHECK` 真实行为、镜像体积、
@@ -437,18 +464,50 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs \
 
 ```text
 # 本机实测（Windows / Python 3.12.9），三种情形各跑一次：
-# ① 门禁命令 + 本机有 HF 缓存：        104 passed, 13 deselected in 0.92s
-# ② 门禁命令 + HF 缓存清空（= runner）：104 passed, 13 deselected in 0.87s
-# ③ 对照组：不清缓存但**不排除**这 13 个用例 → 3 failed, 104 passed, 10 errors（全是"拉不到模型"）
+# ① 门禁命令 + 本机有 HF 缓存：        124 passed, 13 deselected in 2.08s
+# ② 门禁命令 + HF 缓存清空（= runner）：124 passed, 13 deselected in 2.04s（HF_HOME 指空目录实测）
+# ③ 对照组：不清缓存但**不排除**这 13 个用例 → 3 failed, 124 passed, 10 errors（全是"拉不到模型"）
 #    —— 这样才知道要排除的恰好是 13 个，而不是"随手挑了几个让它变绿"
-# ④ 全量（有缓存、无排除）：117 passed in 30.04s（命令见 §5.3）
+# ④ 全量（有缓存、无排除）：137 passed in 27.18s（命令见 §5.3）
 ```
+
+> 新增的三组用例（缓存键隔离 8 + 配置 fail-fast 6 + 指标直方图 6）**都不需要 BGE 模型**：
+> 缓存用例用注入的假模型（`EmbeddingEngine(config, model=假模型)`），其余是纯函数 ——
+> 所以 CI 的「离线可跑」这一性质没有被破坏，`13 deselected` 的数量也保持不变。
+
+### 5.9 Embedding 缓存：键里必须带模型名
+
+**问题（早期实现的一个真 bug）**：缓存键 = 纯文本 MD5，**不含模型名**。
+缓存里存的是「某个模型算出来的向量」，于是改了 `embedding.model_name` 之后旧缓存**照样命中** ——
+拿回来的是**旧模型**的向量，但检索结果 / 指标看上去「一切正常」。
+这是典型的**静默污染**：实验数字看着对，实际跑的是另一个模型，而且**没有任何报错**。
+
+**现在的口径**：
+
+| 项 | 现在的做法 |
+|---|---|
+| 缓存键 | `md5(模型名 + "\n" + 文本1 + "\|\|\|" + 文本2 + …)` —— **模型名是键的一部分** |
+| 缓存文件名 | `<模型标识>-<内容哈希>.npy`（如 `BAAI_bge-small-zh-v1.5-<md5>.npy`），人一眼能看出是哪份模型的向量 |
+| 换模型 | 键变了 → 旧缓存**自然不命中** → **自动失效并重算**（代价只是第一次重算一遍向量） |
+| 旧缓存文件 | **不兼容、不迁移**：留在磁盘上不再被使用，可以直接删（`data/embedding_cache/` 整个目录删掉也没关系） |
+| 回归防护 | `tests/test_embedding_cache.py`：同一段文本用两个不同 `model_name` 各 `encode()` 一次 → 断言**不命中**同一个缓存文件、且两个模型拿到的**不是同一份向量** |
+
+> 「不兼容旧缓存」是有意的取舍：兼容旧键就得在读缓存时比对「这份向量是哪份模型算的」，
+> 而缓存文件里并没有记这个信息（`.npy` 只存数组）—— 只能靠键把它隔离掉。
+> 换句话说：**键里带模型名 = 换模型即失效**，这是最省事也最不容易出错的做法。
+
+**这也意味着两个仓库的缓存文件不通用**（键不同）：[rag-eval-platform](../rag-eval-platform) 与本仓库
+用同一个 embedding 模型时，**向量**可以互换，但**缓存文件**各算各的（见 §3 的对照表）。
+
+> §9.1 / §9.2 那些历史日志里出现的缓存文件名还是**旧的纯哈希格式**（`<md5>.npy`）——
+> 那是 2026-10-19 抓取日志时的样子，升级后的文件名是 `<模型标识>-<md5>.npy`。
 
 ---
 
 ## 6. 接入 Claude Desktop / Cursor
 
-把下面片段合并进客户端配置文件即可（**command 指向本仓库 venv 里的 python，args 指向 `server.py` 的绝对路径**）：
+把下面片段合并进客户端配置文件即可（**command 指向本仓库 venv 里的 python，args 指向 `server.py` 的绝对路径**；
+下面用 `<仓库绝对路径>` 占位，换成你自己 clone 出来的目录即可）：
 
 **Claude Desktop**：`%APPDATA%\Claude\claude_desktop_config.json`（macOS：`~/Library/Application Support/Claude/claude_desktop_config.json`）
 
@@ -456,8 +515,8 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs \
 {
   "mcpServers": {
     "rag-knowledge": {
-      "command": "D:\\programmer\\LLM\\projects\\rag-mcp-server\\.venv\\Scripts\\python.exe",
-      "args": ["D:\\programmer\\LLM\\projects\\rag-mcp-server\\server.py"]
+      "command": "<仓库绝对路径>\\.venv\\Scripts\\python.exe",
+      "args": ["<仓库绝对路径>\\server.py"]
     }
   }
 }
@@ -469,8 +528,8 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs \
 {
   "mcpServers": {
     "rag-knowledge": {
-      "command": "D:\\programmer\\LLM\\projects\\rag-mcp-server\\.venv\\Scripts\\python.exe",
-      "args": ["D:\\programmer\\LLM\\projects\\rag-mcp-server\\server.py"]
+      "command": "<仓库绝对路径>\\.venv\\Scripts\\python.exe",
+      "args": ["<仓库绝对路径>\\server.py"]
     }
   }
 }
@@ -700,7 +759,8 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 
 > 环境：Windows / Python 3.12.9 / mcp 2.3.0 / sentence-transformers 5.7.0 / torch 2.14.1（CPU）/ 2026-10-19。
 > §9.1 / §9.2 是**加入提示注入防护之后重新抓取的**真实运行日志，**原样粘贴**
-> （仅合并了重复的「切分完成」行、省略进度条与脚本自身截断的 JSON 中段，省略处标注 `（略）`）。
+> （仅合并了重复的「切分完成」行、省略进度条与脚本自身截断的 JSON 中段，省略处标注 `（略）`；
+> 日志里的**本机绝对路径统一替换成 `<仓库路径>` 占位**，避免把开发机的目录结构带进公开仓库）。
 
 ### 9.1 冒烟测试（`python scripts\smoke_test.py`）
 
@@ -709,8 +769,8 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 [13:41:35] INFO | rag_mcp | 切分完成：1 个 chunk（size=512, overlap=50）   ← 5 篇文档各 1 个 chunk（日志重复 5 行，此处合并）
 [13:41:44] INFO | rag_mcp | 加载 Embedding 模型：BAAI/bge-small-zh-v1.5（device=cpu, offline=True）
 [1/3] 加载配置并启动检索服务 ...
-      配置文件：D:\programmer\LLM\projects\rag-mcp-server\config.yaml
-      知识库：  D:\programmer\LLM\projects\rag-mcp-server\data\sample\knowledge_base.json
+      配置文件：<仓库路径>\config.yaml
+      知识库：  <仓库路径>\data\sample\knowledge_base.json
 [2/3] 构建索引（首次运行会算向量并写 MD5 缓存）...
 [13:41:44] INFO | rag_mcp | 模型加载完成，向量维度：512
 [13:41:44] INFO | rag_mcp | Embedding 缓存命中 → 4c537b94bcca1b858d3e8ba05a203ba9.npy
@@ -789,7 +849,7 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 ```text
 [server stderr, 启动预热]
 [13:43:32] INFO | rag_mcp.server | MCP Server 启动：rag-mcp-server v0.1.0（stdio）
-[13:43:32] INFO | rag_mcp.server | 知识库：D:\programmer\LLM\projects\rag-mcp-server\data\sample\knowledge_base.json
+[13:43:32] INFO | rag_mcp.server | 知识库：<仓库路径>\data\sample\knowledge_base.json
 [13:43:32] INFO | rag_mcp.server | 端点：stdin/stdout
 [13:43:32] INFO | rag_mcp.server | 提示注入防护：提示注入防护=开启（结构化包裹 <untrusted_data> + 可疑模式标注/中和；不删除任何内容，可疑片段转义为可见形态）
 [13:43:32] INFO | rag_mcp.server | 安全层：stdio 传输不启用鉴权/限流（父子进程本地通信，无网络入口）
@@ -799,7 +859,7 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 [13:43:40] INFO | rag_mcp | 预热完成，耗时 8.09s
 
 [client stdout]
-[client] 启动 server 子进程：D:\programmer\LLM\projects\rag-mcp-server\.venv\Scripts\python.exe server.py
+[client] 启动 server 子进程：<仓库路径>\.venv\Scripts\python.exe server.py
 [client] initialize OK → server=rag-mcp-server v0.1.0
 [client] tools/list → 2 个工具：['search_knowledge', 'knowledge_base_stats']
          - search_knowledge: 检索本地知识库（中文技术文档），返回最相关的若干原文片段与相似度分数。适用场景：用户问题可能依赖私有/本地资料时，先调用本工具拿证据再回答。...
@@ -833,7 +893,8 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 ### 9.3 单元测试（`python -m pytest tests -v`）—— 历史快照（6 个用例）
 
 > 下面是**项目最初（仅 stdio、6 个用例）**时的原样输出，保留作对照。
-> 当前全量用例已增至 **117 passed**（+ 传输 8 + HTTP 安全 30 + 提示注入防护 71 + 并发 2），最新数字见 §5.3。
+> 当前全量用例已增至 **137 passed**（+ 传输 8 + HTTP 安全 30 + 提示注入防护 71 + 并发 2
+> ＋ 缓存键隔离 8 + 配置 fail-fast 6 + 指标直方图 6），最新数字见 §5.3。
 
 ```text
 platform win32 -- Python 3.12.9, pytest-9.1.1, pluggy-1.7.0 -- .venv\Scripts\python.exe
@@ -905,13 +966,29 @@ rag_mcp_tool_calls_total{tool="search_knowledge"} 20000
 # HELP rag_mcp_errors_total 错误总数（HTTP 5xx 响应 + 工具内部异常）
 # TYPE rag_mcp_errors_total counter
 rag_mcp_errors_total 0
-# HELP rag_mcp_request_duration_ms HTTP 请求耗时摘要（毫秒；分位数为最近采样的估算值）
-# TYPE rag_mcp_request_duration_ms summary
-rag_mcp_request_duration_ms{quantile="0.5"} 149.6
-rag_mcp_request_duration_ms{quantile="0.95"} 310.6
-rag_mcp_request_duration_ms{quantile="0.99"} 318.1
-rag_mcp_request_duration_ms_count 20012
+# HELP rag_mcp_request_duration_ms HTTP 请求耗时直方图（毫秒；_bucket 为累计桶计数、_sum/_count 为单调计数器；分位数请用 histogram_quantile(0.95, rate(rag_mcp_request_duration_ms_bucket[5m]))）
+# TYPE rag_mcp_request_duration_ms histogram
+rag_mcp_request_duration_ms_bucket{le="1"} 0
+rag_mcp_request_duration_ms_bucket{le="2"} 0
+rag_mcp_request_duration_ms_bucket{le="5"} 0
+rag_mcp_request_duration_ms_bucket{le="10"} 12
+rag_mcp_request_duration_ms_bucket{le="25"} 240
+rag_mcp_request_duration_ms_bucket{le="50"} 1840
+rag_mcp_request_duration_ms_bucket{le="100"} 9800
+rag_mcp_request_duration_ms_bucket{le="250"} 18120
+rag_mcp_request_duration_ms_bucket{le="500"} 19980
+rag_mcp_request_duration_ms_bucket{le="1000"} 20010
+rag_mcp_request_duration_ms_bucket{le="2500"} 20012
+rag_mcp_request_duration_ms_bucket{le="5000"} 20012
+rag_mcp_request_duration_ms_bucket{le="10000"} 20012
+rag_mcp_request_duration_ms_bucket{le="+Inf"} 20012
 rag_mcp_request_duration_ms_sum 3012345.678
+rag_mcp_request_duration_ms_count 20012
+# HELP rag_mcp_request_duration_ms_recent HTTP 请求耗时的最近 N 次采样分位数（毫秒；**滑动窗口**，值会随时间下降，只供人看；做面板请用上面的直方图）
+# TYPE rag_mcp_request_duration_ms_recent untyped
+rag_mcp_request_duration_ms_recent{quantile="0.5"} 149.6
+rag_mcp_request_duration_ms_recent{quantile="0.95"} 310.6
+rag_mcp_request_duration_ms_recent{quantile="0.99"} 318.1
 # HELP rag_mcp_auth_failures_total 鉴权失败（401）次数
 # TYPE rag_mcp_auth_failures_total counter
 rag_mcp_auth_failures_total 0
@@ -954,12 +1031,14 @@ Failed to read all data for array. Expected (1, 512) = 512 elements, could only 
 | **`top_k` 硬上限 `max_top_k`** | 工具返回值会直接进模型上下文；不设上限等于把「上下文成本」交给模型乱填 | 一次调用塞进几万 token，成本和延迟失控 |
 | **相似度阈值过滤 + `filtered_by_threshold`** | 「检索不到」和「检索到但不相关」是两种不同状态，必须能区分 | 上层无法判断该换问法还是该放弃（对应 Agent 的失败分类） |
 | **空结果不抛异常，返回结构化 `hint`** | 「知识库里没有」是正常业务结果，不是工具故障 | 抛异常会让 Agent 走进「重试」路径，白白重试一次必然失败的操作 |
-| **query 也走 MD5 缓存** | 同一问题被反复问时（Agent 多轮里很常见）零成本 | 每次都重算向量，浪费算力 |
+| **query 也走缓存** | 同一问题被反复问时（Agent 多轮里很常见）零成本 | 每次都重算向量，浪费算力 |
+| **缓存键里带模型名** | 缓存里存的是「某个模型的向量」；键不含模型名 → 换模型后旧缓存照样命中 → **拿旧模型的向量当新模型的结果**，指标却看着正常（静默污染）。键含模型名 = 换模型即失效并重算（见 §5.9） | 换 embedding 模型后实验数字「看着正常」，实际跑的是旧模型 —— 污染无声无息 |
 | **`device: auto` + `offline: true`** | 有 GPU 用 GPU、没有就 CPU；模型缓存后完全离线可复现 | 换台机器就要改配置/联网，演示时容易翻车 |
 | **忘记 `similarity_threshold` 为什么是 0.3** | 与同源平台保持一致口径；它在样例集上能过滤掉领域外问题（见探针 3），属于经验值 | —— |
 | **只用 NumPy 暴力检索** | 几十~几百 chunk 规模下矩阵乘法不是瓶颈，换来零依赖、行为完全可解释 | 引入向量库会多一层运维与调试成本，收益在万级 chunk 才显现 |
 | **鉴权自写纯 ASGI 中间件（不用 SDK OAuth）** | 本场景只需一个共享 Token；OAuth 那一套（授权服务器元数据/动态注册）复杂度与收益不成比例；自写中间件不依赖 Starlette，可脱离框架单测，且不碰请求体（不破坏 SSE 流式响应） | 上 SDK OAuth 要配一堆元数据端点，且难在无框架下单测 |
 | **指标零依赖手写 Prometheus 文本（不用 `prometheus_client`）** | 只需这几类指标，几十行就能算清；**指标不应该成为故障源**——多一个运行时依赖就多一种启动失败可能 | 指标库版本冲突会导致整个服务起不来（可观测性反而制造不可用） |
+| **耗时指标用 Histogram，不用 Summary** | 分位数取自滑动窗口时，summary 的「累积」语义不成立（值会随时间下降，`rate()` 做面板会算错）。直方图桶计数单调、名字与 `_sum`/`_count` 不变 → 既有消费方不受影响，还能用标准 `histogram_quantile()`（见 §5.6.3） | 类型语义与实际口径不一致，面板上的 p99 可能是错的却没人发现 |
 | **限流放在鉴权之前、按身份分桶** | 未带正确 Token 的洪水同样吃 CPU，先限流才挡得住"暴力猜 Token"；按 Token/IP 分桶让合法客户端不被别人拖累 | 先鉴权则匿名洪水直冲协议解析；全局单桶则一人打满全体挨饿 |
 | **限流默认关闭（`rps: 0`）** | 本地开发 / 压测 / 单测不该被限流打扰，生产再显式打开 | 默认开限流会误伤正常的批量客户端与压测，排障时易误判为服务故障 |
 | **`/healthz` 只读、绝不触发建索引** | 探针应如实反映"服务是否可用"，而不是顺手把 5s 建索引塞进一次探针请求 | 探针触发建索引 → 超时判定为不健康 → 容器被反复重启（雪崩） |
@@ -995,27 +1074,30 @@ rag-mcp-server/
 ├── .dockerignore              # 构建上下文排除项（.venv / 缓存 / 测试 / 运行产物）
 ├── .github/workflows/ci.yml   # CI 门禁（通用 GitHub Actions 格式；宿主 Gitee → 镜像到 GitHub 生效，见 §5.8）
 ├── rag/
-│   ├── config.py              # 配置加载：默认值合并 + 相对路径解析 + 环境变量覆盖 + device 自动探测
+│   ├── config.py              # 配置加载：默认值合并 + 相对路径解析 + 环境变量覆盖 + device 自动探测 + 配置校验（fail fast）
 │   ├── logging_utils.py       # 日志统一写 stderr（保住 stdout 给协议）
-│   ├── chunking.py            # 固定窗口切分（最小移植）
-│   ├── embedding.py           # BGE-small-zh-v1.5 + 文本 MD5 缓存（原子写 + 单飞锁）+ 离线开关
+│   ├── chunking.py            # 固定窗口切分（最小移植；策略不符直接报错）
+│   ├── embedding.py           # BGE-small-zh-v1.5 + （模型名+文本）MD5 缓存（原子写 + 单飞锁）+ 离线开关
 │   ├── retrieval.py           # 余弦相似度 + 阈值过滤 + top_k 上限
 │   ├── prompt_guard.py        # 提示注入防护：结构化隔离 + 11 条可疑模式检测/中和 + 不可信包裹（无状态、可并发）
 │   ├── http_security.py       # HTTP 安全层：Bearer 鉴权 + 令牌桶限流（纯 ASGI 中间件，零依赖）
-│   ├── metrics.py             # 进程内指标 + Prometheus 文本导出（手写、零依赖、线程安全）
+│   ├── metrics.py             # 进程内指标 + Prometheus 文本导出（手写、零依赖、线程安全；含耗时直方图）
 │   └── service.py             # KnowledgeService：加载 → 建索引（单飞锁）→ 检索（进程级单例）
 ├── scripts/
 │   ├── smoke_test.py          # 冒烟：不经协议，直接验证检索链路（含领域外问题探针）
 │   ├── mcp_client_demo.py     # 端到端：官方 MCP 客户端 stdio 调用（含 tools/list）
 │   ├── mcp_http_client_demo.py# 端到端：连接已运行的 HTTP Server（streamable-http / sse）
 │   ├── demo_http_security.py  # HTTP 安全能力演示：真起服务子进程，逐条实测 401/429/healthz/注入防护
-│   ├── check_dockerfile_consistency.py # Dockerfile ↔ 仓库现状 静态一致性检查（无 Docker 也能跑，26 项）
+│   ├── check_dockerfile_consistency.py # Dockerfile ↔ 仓库现状 静态一致性检查（无 Docker 也能跑，29 项）
 │   └── bench_http.py          # HTTP 压测：长连接、并发×轮次，输出 p50/p95/p99/QPS/错误率
 ├── tests/
 │   ├── test_service.py        # 8 个检索行为契约 + 并发（原子写缓存 / 索引只建一次）测试
 │   ├── test_http_transport.py # 8 个传输测试（参数映射 + Streamable HTTP 端到端）
 │   ├── test_http_security.py  # 30 个安全测试（401/429/healthz/metrics + 子进程端到端）
-│   └── test_prompt_injection.py # 71 个提示注入防护测试（13 对抗语料 + 7 正常对照 + 服务层 + HTTP 端到端）
+│   ├── test_prompt_injection.py # 71 个提示注入防护测试（13 对抗语料 + 7 正常对照 + 服务层 + HTTP 端到端）
+│   ├── test_embedding_cache.py # 8 个缓存键隔离测试（注入假模型，**不需要 BGE**）
+│   ├── test_config.py         # 6 个配置 fail-fast 测试（策略白名单，**不需要 BGE**）
+│   └── test_metrics.py        # 6 个耗时直方图语义测试（**不需要 BGE**）
 └── data/sample/
     └── knowledge_base.json    # 示例知识库（5 篇中文技术短文，与 rag-eval-platform 同源同文件）
 ```
@@ -1031,6 +1113,12 @@ rag-mcp-server/
   因此**无法给出 Recall@K 之类的正式指标**；本项目只对「行为契约」做了测试。
   检索效果的正式评测在 [rag-eval-platform](../rag-eval-platform) 侧（三层指标 + 真实实验数据）。
 - **切分策略**：只移植了固定窗口切分；原平台的 recursive / semantic 未移植。
+  配了没实现的策略（`chunking.strategy: semantic`）会在**加载配置时直接报错**，不会静默按 fixed_size 跑。
+- **Embedding 缓存不跨模型共享**（详见 §5.9）：缓存键含模型名，换模型后旧缓存**自动失效并重算**；
+  代价是换模型后的第一次请求会慢（要重算一遍向量），好处是绝不会拿旧模型的向量冒充新模型。
+  旧键生成的缓存文件不再被使用，留在 `data/embedding_cache/` 里可以直接删。
+- **耗时指标是单实例内存态**：直方图桶计数与 `_recent` 滑动窗口分位数都只在本进程内累计，
+  多副本部署时每个进程各有一套（需要全局聚合就把抓取放到网关/边车，见 §5.6）。
 - **传输模式**：已支持 `stdio` / `streamable-http` / `sse` 三种；本地已端到端验证并**做了压测（§9.4）**。
   但仍**未验证反向代理 / TLS 终止 / 多实例会话粘滞**等生产级场景；多副本部署需配合 `--stateless`。
 - **鉴权**：`stdio` 是本机子进程模式，无鉴权；HTTP 已内置 **Bearer Token 鉴权 + 令牌桶限流**（§5.6）。

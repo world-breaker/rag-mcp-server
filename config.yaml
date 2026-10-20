@@ -8,7 +8,7 @@ knowledge_base:
   # path: "../rag-eval-platform/data/sample/knowledge_base.json"
 
 chunking:
-  strategy: "fixed_size"   # 本仓库只移植了固定窗口切分（原平台另有 recursive / semantic）
+  strategy: "fixed_size"   # 本仓库只实现了固定窗口切分；写别的值会在加载时直接报错（fail fast，不静默忽略）
   chunk_size: 512          # 字符数：一个 chunk 覆盖一段完整技术要点
   chunk_overlap: 50        # 重叠字符数：防止关键句被切在窗口边界上
 
@@ -16,7 +16,7 @@ embedding:
   model_name: "BAAI/bge-small-zh-v1.5"   # 中文小模型，512 维
   device: "auto"           # auto（有 GPU 用 GPU，否则 CPU）| cpu | cuda
   batch_size: 64
-  cache_dir: "./data/embedding_cache"    # 文本 MD5 缓存：内容不变不重算
+  cache_dir: "./data/embedding_cache"    # （模型名+文本）MD5 缓存：内容不变不重算；换模型自动失效并重算
   offline: true            # 模型已在本机缓存 → 禁止联网，完全离线可复现
 
 retrieval:

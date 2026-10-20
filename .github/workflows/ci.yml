@@ -55,12 +55,13 @@ jobs:
       - name: 安装依赖
         run: python -m pip install -r requirements.txt
 
-      # 期望结果：104 passed, 13 deselected（117 - 13 = 104；本机实测见 README §5.8）
+      # 期望结果：124 passed, 13 deselected（137 - 13 = 124；本机实测见 README §5.8）
       # 排除的 13 个用例分三类：
       #   ① tests/test_service.py 整个文件（8 个）：module 级 fixture 一上来就 build_index()，必须真实 BGE；
       #   ② 3 个子进程端到端：server 启动即预热索引，同样要模型；
       #   ③ 2 个用真实 KnowledgeService 建索引的服务层用例（real_service / adversarial_service）。
-      # 断言一条都没删：本机（有 HF 缓存）跑全量是 117 passed，命令见 README §5.3。
+      # 断言一条都没删：本机（有 HF 缓存）跑全量是 137 passed，命令见 README §5.3。
+      # 新增的三组用例（缓存键隔离 / 配置 fail-fast / 指标直方图）**不需要模型**，照跑不误。
       - name: 单元测试（离线；排除需要本机 BGE 模型缓存的用例）
         run: |
           python -m pytest -q -rs \

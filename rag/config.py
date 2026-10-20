@@ -15,6 +15,11 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config.yaml"
 
+#: 本仓库只实现了固定窗口切分（fixed_size）。
+#: 配置里写了别的策略 → 加载时直接报错，而不是「配了但静默按 fixed_size 跑」：
+#: 「以为配了其实没生效」比「没配」更危险（同一口径见 rag/http_security.py 的 fail fast）。
+SUPPORTED_CHUNKING_STRATEGIES: tuple[str, ...] = ("fixed_size",)
+
 # 代码内默认值：与 config.yaml 保持一致，缺项时兜底
 DEFAULTS: Dict[str, Any] = {
     "knowledge_base": {
@@ -98,6 +103,24 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return result
 
 
+def _validate_config(config: Dict[str, Any]) -> None:
+    """配置校验：发现「配了但不会生效」的键就立刻报错（fail fast）。
+
+    口径与 `rag/http_security.py` 的 `SecuritySettings` 一致：
+    **「以为配了其实没生效」比「没配」更危险** —— 后者一眼就看出来了，
+    前者会让人以为行为已经按配置生效（这里就是：写了 `chunking.strategy: semantic`，
+    但本仓库只实现了 fixed_size，配置会被静默忽略）。
+    """
+    chunking = config.get("chunking") or {}
+    strategy = str(chunking.get("strategy", "fixed_size")).strip().lower()
+    if strategy not in SUPPORTED_CHUNKING_STRATEGIES:
+        raise ValueError(
+            f"chunking.strategy={strategy!r} 不被支持："
+            f"本仓库只实现了 {', '.join(SUPPORTED_CHUNKING_STRATEGIES)}"
+            "（切分策略对比是 rag-eval-platform 的职责，见 README §3 / §12）"
+        )
+
+
 def load_config(path: str | Path | None = None) -> Dict[str, Any]:
     """加载配置：默认读仓库根目录的 config.yaml。"""
     config_path = Path(path) if path else DEFAULT_CONFIG_PATH
@@ -170,6 +193,9 @@ def load_config(path: str | Path | None = None) -> Dict[str, Any]:
     raw_offline = os.environ.get("RAG_MCP_EMBEDDING_OFFLINE")
     if raw_offline is not None and raw_offline != "":
         config["embedding"]["offline"] = str(raw_offline).strip().lower() in ("1", "true", "yes", "on")
+
+    # 校验放在最后：环境变量覆盖完再校验，避免「文件里写对了、环境变量写错了」被漏掉
+    _validate_config(config)
 
     return config
 
