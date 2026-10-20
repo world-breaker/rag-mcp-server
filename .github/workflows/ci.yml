@@ -1,6 +1,6 @@
 # rag-mcp-server 的 CI 门禁（通用 GitHub Actions 格式）。
 #
-# 宿主说明：本仓库托管在 **Gitee（私有仓库）**，Gitee 不会执行 GitHub Actions
+# 宿主说明：本仓库托管在 **Gitee（公开仓库）**，Gitee 不会执行 GitHub Actions
 # （Gitee Go 也暂未接入），所以本文件在 Gitee 侧只是"可执行的门禁声明"，
 # 镜像一份到 GitHub 即开即用（原因与本地复现命令见 README §5.8）。
 #
