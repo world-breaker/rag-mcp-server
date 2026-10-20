@@ -1,5 +1,7 @@
 # rag-mcp-server —— 把 RAG 检索能力封装成标准 MCP Server
 
+**仓库地址**：Gitee https://gitee.com/tmlKevin/rag-mcp-server ｜ GitHub https://github.com/world-breaker/rag-mcp-server
+
 [![CI](https://github.com/world-breaker/rag-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/world-breaker/rag-mcp-server/actions/workflows/ci.yml)
 
 > 用 **Python + 官方 MCP SDK（stdio 模式）** 把一套 RAG 检索链路暴露成标准 MCP 工具：
