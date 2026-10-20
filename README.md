@@ -171,7 +171,7 @@ pip install -r requirements.txt
 > ＋ HTTP 安全 30（`test_http_security.py`，含 1 个子进程端到端用例）
 > ＋ 提示注入防护 71（`test_prompt_injection.py`，含 1 个真实 HTTP 端到端用例）
 > ＋ 缓存键隔离 9（`test_embedding_cache.py`）＋ 配置 fail-fast 6（`test_config.py`）
-> ＋ 指标直方图语义 6（`test_metrics.py`）。
+> ＋ 指标直方图语义 7（`test_metrics.py`）。
 > 后三组**不需要真实 BGE 模型**（缓存用例注入假模型、其余是纯函数），因此 CI 离线也能跑。
 > ⚠️ 跑 HTTP 相关用例前若本机挂了全局代理，先设 `NO_PROXY=127.0.0.1,localhost`——
 > 否则对 `127.0.0.1` 的请求会被代理转发，回一个与预期不符的 502。
