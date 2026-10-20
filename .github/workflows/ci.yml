@@ -1,8 +1,8 @@
 # rag-mcp-server 的 CI 门禁（通用 GitHub Actions 格式）。
 #
-# 宿主说明：本仓库托管在 **Gitee（公开仓库）**，Gitee 不会执行 GitHub Actions
+# 宿主说明（本仓库 2026-10-20 已镜像到 GitHub）：Actions **会**执行本文件，
+# 每次 push / PR 自动跑一遍测试；Gitee 侧不执行 GitHub Actions（若接 Gitee Go 另配）。
 # （Gitee Go 也暂未接入），所以本文件在 Gitee 侧只是"可执行的门禁声明"，
-# 镜像一份到 GitHub 即开即用（原因与本地复现命令见 README §5.8）。
 #
 # ★ 离线设计（CI runner 上没有本机那份 BGE 模型缓存，且本项目 CI **不下载模型**）：
 #   1) HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE = 1

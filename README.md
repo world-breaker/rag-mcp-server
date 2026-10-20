@@ -1,5 +1,7 @@
 # rag-mcp-server —— 把 RAG 检索能力封装成标准 MCP Server
 
+[![CI](https://github.com/world-breaker/rag-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/world-breaker/rag-mcp-server/actions/workflows/ci.yml)
+
 > 用 **Python + 官方 MCP SDK（stdio 模式）** 把一套 RAG 检索链路暴露成标准 MCP 工具：
 > Claude Desktop、Cursor、任意 MCP 客户端（包括我自己写的 [hello-agent](../hello-agent)）都能直接调用。
 > **不依赖任何外部 LLM**，装完依赖即可离线运行。
@@ -467,9 +469,11 @@ docker run --rm -p 8000:8000 \
 
 `ubuntu-latest` + Python 3.12 + `pip` 依赖缓存 + `pytest`，**离线可跑、不需要密钥、不下载模型**。
 
-> **宿主如实说明**：本仓库托管在 **Gitee（公开仓库）**，Gitee 不会执行 GitHub Actions，也还没接 Gitee Go。
+> **宿主如实说明**：本仓库**同时托管在 Gitee 与 GitHub**（两边是同一份历史、同一批 commit SHA）。
+> **GitHub 侧 Actions 会执行**：每次 push / PR 自动跑一遍测试（本文顶部的徽章是真实运行状态，不是摆设）；
+> Gitee 侧不执行 GitHub Actions（若日后接 Gitee Go 另配）。
 > 这份 YAML 用的是**通用 GitHub Actions 格式**——镜像一份到 GitHub 即可直接生效，
-> 但在 Gitee 侧目前不是自动跑的流水线。也因此 README 里**不放 CI 徽章**：徽章指向 GitHub Actions，而本仓库的流水线在 Gitee 侧不会跑，徽章只会 404。
+> Gitee 侧不执行 GitHub Actions。因此 README **挂 CI 徽章**：它指向 GitHub Actions 的真实运行状态（仓库已镜像到 GitHub）。
 
 两个环境变量各自对着一个真实坑，不是仪式感：
 
