@@ -85,6 +85,22 @@ def test_cache_key_differs_by_model_name_but_is_stable(tmp_path):
     assert engine_a._cache_key(["a", "b"]) != engine_a._cache_key(["b", "a"])
 
 
+def test_cache_key_formula_is_pinned(tmp_path):
+    """键公式钉死：md5(模型名 + "\\n" + "|||".join(文本))。
+
+    为什么钉死：这个公式必须和 rag-eval-platform 侧**逐字节一致**（那边 2026-10-20
+    做了同样的修正），两边才能算出同一个键。这里写死断言，改公式就会红。
+    """
+    engine = _engine(MODEL_A, tmp_path)
+    texts = ["甲", "乙"]
+    blob = f"{MODEL_A}\n" + "|||".join(texts)
+    expected = hashlib.md5(blob.encode("utf-8")).hexdigest()
+    assert engine._cache_key(texts) == expected
+    # 单段文本时就是 md5(模型名 + "\n" + 文本)
+    single = hashlib.md5(f"{MODEL_A}\n甲".encode("utf-8")).hexdigest()
+    assert engine._cache_key(["甲"]) == single
+
+
 def test_same_model_hits_cache_on_second_encode(tmp_path):
     """同一个模型、同一段文本：第二次必须命中缓存（缓存本身没被改坏）。"""
     engine = _engine(MODEL_A, tmp_path)
