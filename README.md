@@ -507,7 +507,7 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs \
 ## 6. 接入 Claude Desktop / Cursor
 
 把下面片段合并进客户端配置文件即可（**command 指向本仓库 venv 里的 python，args 指向 `server.py` 的绝对路径**；
-下面用 `<仓库绝对路径>` 占位，换成你自己 clone 出来的目录即可）：
+下面用 `<repo>` 占位——`<repo>` = 你 clone 出来的仓库根目录，替换成自己的实际路径即可）：
 
 **Claude Desktop**：`%APPDATA%\Claude\claude_desktop_config.json`（macOS：`~/Library/Application Support/Claude/claude_desktop_config.json`）
 
@@ -515,8 +515,8 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs \
 {
   "mcpServers": {
     "rag-knowledge": {
-      "command": "<仓库绝对路径>\\.venv\\Scripts\\python.exe",
-      "args": ["<仓库绝对路径>\\server.py"]
+      "command": "<repo>/.venv/Scripts/python.exe",
+      "args": ["<repo>/server.py"]
     }
   }
 }
@@ -528,8 +528,8 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs \
 {
   "mcpServers": {
     "rag-knowledge": {
-      "command": "<仓库绝对路径>\\.venv\\Scripts\\python.exe",
-      "args": ["<仓库绝对路径>\\server.py"]
+      "command": "<repo>/.venv/Scripts/python.exe",
+      "args": ["<repo>/server.py"]
     }
   }
 }
@@ -760,7 +760,7 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 > 环境：Windows / Python 3.12.9 / mcp 2.3.0 / sentence-transformers 5.7.0 / torch 2.14.1（CPU）/ 2026-10-19。
 > §9.1 / §9.2 是**加入提示注入防护之后重新抓取的**真实运行日志，**原样粘贴**
 > （仅合并了重复的「切分完成」行、省略进度条与脚本自身截断的 JSON 中段，省略处标注 `（略）`；
-> 日志里的**本机绝对路径统一替换成 `<仓库路径>` 占位**，避免把开发机的目录结构带进公开仓库）。
+> 日志里的**本机绝对路径统一替换成 `<repo>` 占位**（`<repo>` = 仓库根目录），避免把开发机的目录结构带进公开仓库）。
 
 ### 9.1 冒烟测试（`python scripts\smoke_test.py`）
 
@@ -769,8 +769,8 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 [13:41:35] INFO | rag_mcp | 切分完成：1 个 chunk（size=512, overlap=50）   ← 5 篇文档各 1 个 chunk（日志重复 5 行，此处合并）
 [13:41:44] INFO | rag_mcp | 加载 Embedding 模型：BAAI/bge-small-zh-v1.5（device=cpu, offline=True）
 [1/3] 加载配置并启动检索服务 ...
-      配置文件：<仓库路径>\config.yaml
-      知识库：  <仓库路径>\data\sample\knowledge_base.json
+      配置文件：<repo>/config.yaml
+      知识库：  <repo>/data/sample/knowledge_base.json
 [2/3] 构建索引（首次运行会算向量并写 MD5 缓存）...
 [13:41:44] INFO | rag_mcp | 模型加载完成，向量维度：512
 [13:41:44] INFO | rag_mcp | Embedding 缓存命中 → 4c537b94bcca1b858d3e8ba05a203ba9.npy
@@ -849,7 +849,7 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 ```text
 [server stderr, 启动预热]
 [13:43:32] INFO | rag_mcp.server | MCP Server 启动：rag-mcp-server v0.1.0（stdio）
-[13:43:32] INFO | rag_mcp.server | 知识库：<仓库路径>\data\sample\knowledge_base.json
+[13:43:32] INFO | rag_mcp.server | 知识库：<repo>/data/sample/knowledge_base.json
 [13:43:32] INFO | rag_mcp.server | 端点：stdin/stdout
 [13:43:32] INFO | rag_mcp.server | 提示注入防护：提示注入防护=开启（结构化包裹 <untrusted_data> + 可疑模式标注/中和；不删除任何内容，可疑片段转义为可见形态）
 [13:43:32] INFO | rag_mcp.server | 安全层：stdio 传输不启用鉴权/限流（父子进程本地通信，无网络入口）
@@ -859,7 +859,7 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 [13:43:40] INFO | rag_mcp | 预热完成，耗时 8.09s
 
 [client stdout]
-[client] 启动 server 子进程：<仓库路径>\.venv\Scripts\python.exe server.py
+[client] 启动 server 子进程：<repo>/.venv/Scripts/python.exe server.py
 [client] initialize OK → server=rag-mcp-server v0.1.0
 [client] tools/list → 2 个工具：['search_knowledge', 'knowledge_base_stats']
          - search_knowledge: 检索本地知识库（中文技术文档），返回最相关的若干原文片段与相似度分数。适用场景：用户问题可能依赖私有/本地资料时，先调用本工具拿证据再回答。...
