@@ -36,6 +36,24 @@ def test_duration_metric_is_declared_as_histogram():
     assert "rag_mcp_request_duration_ms{quantile=" not in text
 
 
+def test_help_text_gives_the_aggregated_quantile_query():
+    """HELP 里推荐的 PromQL 必须是**聚合后**的分位数写法。
+
+    `histogram_quantile(0.95, rate(..._bucket[5m]))` 少了 `sum by (le)`：
+    单实例碰巧能算，多实例时每个 `le` 有多条序列 → Prometheus 直接报错。
+    这条断言把「正确写法」钉死在代码里，防止以后又被改回缺聚合的版本。
+    """
+    metrics = Metrics()
+    metrics.record_request(200, 12.0)
+    text = metrics.render_prometheus()
+
+    help_line = next(
+        line for line in text.splitlines() if line.startswith("# HELP rag_mcp_request_duration_ms ")
+    )
+    assert "histogram_quantile(0.95, sum(rate(rag_mcp_request_duration_ms_bucket[5m])) by (le))" in help_line
+    assert "histogram_quantile(0.95, rate(" not in help_line
+
+
 def test_histogram_buckets_are_cumulative_and_match_count():
     metrics = Metrics()
     for duration in (0.5, 3.0, 7.0, 30.0, 200.0, 30000.0):

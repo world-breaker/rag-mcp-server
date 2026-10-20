@@ -332,6 +332,10 @@ curl -i -H "Authorization: Bearer please-change-me" http://127.0.0.1:8000/mcp
 | `rag_mcp_errors_total` | counter | 错误总数（HTTP 5xx ＋ 工具内部异常） |
 | `rag_mcp_request_duration_ms` | histogram | 请求耗时（毫秒）直方图：`_bucket{le="…"}` 累计桶计数 + `_sum` / `_count`（**单调计数器**） |
 | `rag_mcp_request_duration_ms_recent{quantile}` | untyped | 最近 N 次采样的 p50/p95/p99（**滑动窗口**，值会随时间下降，**只供人看**；做面板请用上面的直方图） |
+
+> ⚠️ **破坏性变更（升级必看）**：旧版的 `rag_mcp_request_duration_ms{quantile="0.5"}`（含 0.95 / 0.99）
+> **已经移除**，新的分位数序列是 `rag_mcp_request_duration_ms_recent{quantile="…"}`。
+> 依赖旧 quantile 序列的**看板 / 告警会直接断**（查询返回空，不报错）——迁移写法见 §5.6.3。
 | `rag_mcp_auth_failures_total` | counter | 鉴权失败（401）次数 |
 | `rag_mcp_rate_limited_total` | counter | 被限流拒绝（429）次数 |
 | `rag_mcp_prompt_injection_findings_total{rule}` | counter | 检索结果里命中的提示注入可疑模式次数（按规则 id 分组，见 §7） |
@@ -363,12 +367,51 @@ curl -i -H "Authorization: Bearer please-change-me" http://127.0.0.1:8000/mcp
 
 | 指标 | 类型 | 语义 | 怎么用 |
 |---|---|---|---|
-| `rag_mcp_request_duration_ms` | **histogram** | 桶计数**只增不减**（单调），`_sum`/`_count` 名字与语义都不变 | `histogram_quantile(0.95, rate(rag_mcp_request_duration_ms_bucket[5m]))`（标准写法，可跨实例聚合） |
+| `rag_mcp_request_duration_ms` | **histogram** | 桶计数**只增不减**（单调），`_sum`/`_count` 名字与语义都不变 | `histogram_quantile(0.95, sum(rate(rag_mcp_request_duration_ms_bucket[5m])) by (le))`（标准写法，可跨实例聚合） |
 | `rag_mcp_request_duration_ms_recent{quantile}` | **untyped** | 最近 N 次采样的 p50/p95/p99，**滑动窗口**、值会下降 | 只供人看（`curl /metrics` 一眼看出当前延迟）；**不要**拿它做面板 |
 
+##### 5.6.3.1 破坏性变更与迁移写法（升级必看）
+
+**① 旧序列已移除**：旧版的
+
+```text
+rag_mcp_request_duration_ms{quantile="0.5"}    ← 已移除
+rag_mcp_request_duration_ms{quantile="0.95"}   ← 已移除
+rag_mcp_request_duration_ms{quantile="0.99"}   ← 已移除
+```
+
+**已经不存在了**（它们与 histogram 的类型语义冲突，不能同属一个 family）。
+新的分位数序列是 `rag_mcp_request_duration_ms_recent{quantile="0.5" | "0.95" | "0.99"}`。
+**依赖旧 quantile 序列的看板 / 告警会直接断**：PromQL 查不到就是查不到，**不会报错**，
+面板上只会「安静地变空」——所以升级后请务必按下面的写法改一次查询。
+
+**② 迁移写法（做面板 / 告警请用这个）**：
+
+```promql
+# ✅ 标准写法：先对桶计数取 rate，再按 le 聚合，最后算分位数
+histogram_quantile(0.95, sum(rate(rag_mcp_request_duration_ms_bucket[5m])) by (le))
+```
+
+**顺序不能反**，原因各不相同：
+
+| 写法 | 结果 | 为什么 |
+|---|---|---|
+| `histogram_quantile(0.95, sum(rate(..._bucket[5m])) by (le))` | ✅ 正确 | `rate` 先作用在每条桶序列上（计数器求导），`sum by (le)` 再把多实例的同名桶合并，`histogram_quantile` 最后在「每个 `le` 唯一」的向量上插值 |
+| `histogram_quantile(0.95, rate(..._bucket[5m]))` | ❌ 多实例直接报错 | 少了 `sum by (le)`：多实例时每个 `le` 有多条序列，`histogram_quantile` 要求每个 `le` 唯一 → Prometheus 报 many-to-many / duplicate label 错误（**单实例时碰巧能算**，所以这个坑很容易漏到上线） |
+| `rate(sum by (le) (..._bucket)[5m:])` | ❌ 语义走偏 | 先聚合再取窗口，丢掉「每条桶序列各自的 rate」这一步；本仓库的桶是**进程内单实例内存态**，多副本场景必须先各自 rate 再合并 |
+
+**③ 如果你就是要「最近 2048 次采样的滑动窗口分位数」**：改读
+`rag_mcp_request_duration_ms_recent{quantile="0.95"}` 即可，但请注意它的口径：
+
+- 它是**窗口口径**：只覆盖最近 N 次采样，**值会随时间下降**（慢请求滑出窗口后 p99 会变小）；
+- 它**不是累计量**（这正是它被声明成 `untyped` 而不是 `summary` 的原因）；
+- **不能当 SLO / 告警指标用**：SLO 要的是「一段时间内的分位数」，那是 `histogram_quantile(...[5m])` 的活。
+  用窗口分位数做告警，会在流量突增被挤出窗口后「自己变好」，属于典型的假性达标。
+
 **取舍说明**：`rate(rag_mcp_request_duration_ms_count[5m])` / `..._sum[...]` 这类既有消费方
-**完全不受影响**（名字与单调语义都保住了）；变的只有 `quantile="…"` 那三条 series ——
-它们搬家到了 `_recent` 并改了类型（从 `summary` 变成 `untyped`，因为它本来就不是累计量）。
+**完全不受影响**（名字与单调语义都保住了）；但**依赖 `quantile="…"` 那三条 series 的看板 / 告警会断**
+（这是**破坏性变更**，迁移写法见 §5.6.3.1）——它们搬家到了 `_recent` 并改了类型
+（从 `summary` 变成 `untyped`，因为它本来就不是累计量）。
 用直方图换来的是「桶计数可跨实例聚合 + 标准 `histogram_quantile()`」，这是 summary 给不了的。
 桶边界见 `rag/metrics.py` 的 `DEFAULT_DURATION_BUCKETS`（1ms~10s，共 13 档）。
 
@@ -966,7 +1009,7 @@ rag_mcp_tool_calls_total{tool="search_knowledge"} 20000
 # HELP rag_mcp_errors_total 错误总数（HTTP 5xx 响应 + 工具内部异常）
 # TYPE rag_mcp_errors_total counter
 rag_mcp_errors_total 0
-# HELP rag_mcp_request_duration_ms HTTP 请求耗时直方图（毫秒；_bucket 为累计桶计数、_sum/_count 为单调计数器；分位数请用 histogram_quantile(0.95, rate(rag_mcp_request_duration_ms_bucket[5m]))）
+# HELP rag_mcp_request_duration_ms HTTP 请求耗时直方图（毫秒；_bucket 为累计桶计数、_sum/_count 为单调计数器；分位数请用 histogram_quantile(0.95, sum(rate(rag_mcp_request_duration_ms_bucket[5m])) by (le))）
 # TYPE rag_mcp_request_duration_ms histogram
 rag_mcp_request_duration_ms_bucket{le="1"} 0
 rag_mcp_request_duration_ms_bucket{le="2"} 0
@@ -1038,7 +1081,7 @@ Failed to read all data for array. Expected (1, 512) = 512 elements, could only 
 | **只用 NumPy 暴力检索** | 几十~几百 chunk 规模下矩阵乘法不是瓶颈，换来零依赖、行为完全可解释 | 引入向量库会多一层运维与调试成本，收益在万级 chunk 才显现 |
 | **鉴权自写纯 ASGI 中间件（不用 SDK OAuth）** | 本场景只需一个共享 Token；OAuth 那一套（授权服务器元数据/动态注册）复杂度与收益不成比例；自写中间件不依赖 Starlette，可脱离框架单测，且不碰请求体（不破坏 SSE 流式响应） | 上 SDK OAuth 要配一堆元数据端点，且难在无框架下单测 |
 | **指标零依赖手写 Prometheus 文本（不用 `prometheus_client`）** | 只需这几类指标，几十行就能算清；**指标不应该成为故障源**——多一个运行时依赖就多一种启动失败可能 | 指标库版本冲突会导致整个服务起不来（可观测性反而制造不可用） |
-| **耗时指标用 Histogram，不用 Summary** | 分位数取自滑动窗口时，summary 的「累积」语义不成立（值会随时间下降，`rate()` 做面板会算错）。直方图桶计数单调、名字与 `_sum`/`_count` 不变 → 既有消费方不受影响，还能用标准 `histogram_quantile()`（见 §5.6.3） | 类型语义与实际口径不一致，面板上的 p99 可能是错的却没人发现 |
+| **耗时指标用 Histogram，不用 Summary** | 分位数取自滑动窗口时，summary 的「累积」语义不成立（值会随时间下降，`rate()` 做面板会算错）。直方图桶计数单调、名字与 `_sum`/`_count` 不变 → 计数类消费方不受影响，还能用标准 `histogram_quantile()`；代价是**旧的 quantile 序列被移除**（破坏性变更，迁移写法见 §5.6.3.1） | 类型语义与实际口径不一致，面板上的 p99 可能是错的却没人发现 |
 | **限流放在鉴权之前、按身份分桶** | 未带正确 Token 的洪水同样吃 CPU，先限流才挡得住"暴力猜 Token"；按 Token/IP 分桶让合法客户端不被别人拖累 | 先鉴权则匿名洪水直冲协议解析；全局单桶则一人打满全体挨饿 |
 | **限流默认关闭（`rps: 0`）** | 本地开发 / 压测 / 单测不该被限流打扰，生产再显式打开 | 默认开限流会误伤正常的批量客户端与压测，排障时易误判为服务故障 |
 | **`/healthz` 只读、绝不触发建索引** | 探针应如实反映"服务是否可用"，而不是顺手把 5s 建索引塞进一次探针请求 | 探针触发建索引 → 超时判定为不健康 → 容器被反复重启（雪崩） |

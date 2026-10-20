@@ -31,9 +31,13 @@
 - `rag_mcp_request_duration_ms` = **histogram**：桶计数**只增不减**（单调），
   `_sum`/`_count` 的名字与语义都不变 → 既有 `rate(rag_mcp_request_duration_ms_count[5m])`
   这类消费方**不受影响**；分位数用标准写法
-  `histogram_quantile(0.95, rate(rag_mcp_request_duration_ms_bucket[5m]))` 算，且可跨实例聚合。
+  `histogram_quantile(0.95, sum(rate(rag_mcp_request_duration_ms_bucket[5m])) by (le))` 算，
+  且可跨实例聚合（`sum by (le)` 那个聚合**不能省**：多实例时每个 `le` 会有多条序列）。
 - `rag_mcp_request_duration_ms_recent` = **untyped**：保留原来那套滑动窗口分位数（p50/p95/p99），
   改名 + HELP 里写明「滑动窗口、值会下降、只供人看」，避免有人拿它做面板。
+
+⚠️ **破坏性变更**：旧版的 `rag_mcp_request_duration_ms{quantile="0.5"}`（以及 0.95 / 0.99）
+**已移除** —— 它与 histogram 的类型语义冲突，不能同属一个 family。迁移写法见 README §5.6.3。
 """
 
 import threading
@@ -57,7 +61,7 @@ _HELP = {
     "errors_total": "错误总数（HTTP 5xx 响应 + 工具内部异常）",
     "request_duration_ms": (
         "HTTP 请求耗时直方图（毫秒；_bucket 为累计桶计数、_sum/_count 为单调计数器；"
-        "分位数请用 histogram_quantile(0.95, rate(rag_mcp_request_duration_ms_bucket[5m]))）"
+        "分位数请用 histogram_quantile(0.95, sum(rate(rag_mcp_request_duration_ms_bucket[5m])) by (le))）"
     ),
     "request_duration_ms_recent": (
         "HTTP 请求耗时的最近 N 次采样分位数（毫秒；**滑动窗口**，值会随时间下降，"
