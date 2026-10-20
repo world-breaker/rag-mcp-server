@@ -163,10 +163,10 @@ pip install -r requirements.txt
 .venv\Scripts\python.exe -m pytest tests -v
 ```
 
-> 本机实测 **137 passed**：检索行为契约 8（`test_service.py`）＋ 传输 8（`test_http_transport.py`）
+> 本机实测 **139 passed**：检索行为契约 8（`test_service.py`）＋ 传输 8（`test_http_transport.py`）
 > ＋ HTTP 安全 30（`test_http_security.py`，含 1 个子进程端到端用例）
 > ＋ 提示注入防护 71（`test_prompt_injection.py`，含 1 个真实 HTTP 端到端用例）
-> ＋ 缓存键隔离 8（`test_embedding_cache.py`）＋ 配置 fail-fast 6（`test_config.py`）
+> ＋ 缓存键隔离 9（`test_embedding_cache.py`）＋ 配置 fail-fast 6（`test_config.py`）
 > ＋ 指标直方图语义 6（`test_metrics.py`）。
 > 后三组**不需要真实 BGE 模型**（缓存用例注入假模型、其余是纯函数），因此 CI 离线也能跑。
 > ⚠️ 跑 HTTP 相关用例前若本机挂了全局代理，先设 `NO_PROXY=127.0.0.1,localhost`——
@@ -259,7 +259,7 @@ HTTP 客户端接入（Cursor / 支持远程 MCP 的客户端）：
 
 **本机实测（2026-10-18）**：`streamable-http` 端到端通过——`initialize` → `tools/list`（2 个工具）→
 `search_knowledge`（LoRA / RAG 命中，领域外问题被阈值过滤）→ `knowledge_base_stats`；
-全量测试 **137 passed**，`stdio` 行为零回归。HTTP 生产化加固见 **§5.6**、容器见 **§5.7**、压测数据见 **§9.4**。
+全量测试 **139 passed**，`stdio` 行为零回归。HTTP 生产化加固见 **§5.6**、容器见 **§5.7**、压测数据见 **§9.4**。
 
 ---
 
@@ -507,14 +507,14 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs \
 
 ```text
 # 本机实测（Windows / Python 3.12.9），三种情形各跑一次：
-# ① 门禁命令 + 本机有 HF 缓存：        124 passed, 13 deselected in 2.08s
-# ② 门禁命令 + HF 缓存清空（= runner）：124 passed, 13 deselected in 2.04s（HF_HOME 指空目录实测）
+# ① 门禁命令 + 本机有 HF 缓存：        126 passed, 13 deselected in 5.36s
+# ② 门禁命令 + HF 缓存清空（= runner）：126 passed, 13 deselected in 3.74s（HF_HOME 指空目录实测）
 # ③ 对照组：不清缓存但**不排除**这 13 个用例 → 3 failed, 124 passed, 10 errors（全是"拉不到模型"）
 #    —— 这样才知道要排除的恰好是 13 个，而不是"随手挑了几个让它变绿"
-# ④ 全量（有缓存、无排除）：137 passed in 27.18s（命令见 §5.3）
+# ④ 全量（有缓存、无排除）：139 passed in 89.49s（命令见 §5.3）
 ```
 
-> 新增的三组用例（缓存键隔离 8 + 配置 fail-fast 6 + 指标直方图 6）**都不需要 BGE 模型**：
+> 新增的三组用例（缓存键隔离 9 + 配置 fail-fast 6 + 指标直方图 7）**都不需要 BGE 模型**：
 > 缓存用例用注入的假模型（`EmbeddingEngine(config, model=假模型)`），其余是纯函数 ——
 > 所以 CI 的「离线可跑」这一性质没有被破坏，`13 deselected` 的数量也保持不变。
 
@@ -938,8 +938,8 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 ### 9.3 单元测试（`python -m pytest tests -v`）—— 历史快照（6 个用例）
 
 > 下面是**项目最初（仅 stdio、6 个用例）**时的原样输出，保留作对照。
-> 当前全量用例已增至 **137 passed**（+ 传输 8 + HTTP 安全 30 + 提示注入防护 71 + 并发 2
-> ＋ 缓存键隔离 8 + 配置 fail-fast 6 + 指标直方图 6），最新数字见 §5.3。
+> 当前全量用例已增至 **139 passed**（+ 传输 8 + HTTP 安全 30 + 提示注入防护 71 + 并发 2
+> ＋ 缓存键隔离 9 + 配置 fail-fast 6 + 指标直方图 7），最新数字见 §5.3。
 
 ```text
 platform win32 -- Python 3.12.9, pytest-9.1.1, pluggy-1.7.0 -- .venv\Scripts\python.exe
@@ -1140,7 +1140,7 @@ rag-mcp-server/
 │   ├── test_http_transport.py # 8 个传输测试（参数映射 + Streamable HTTP 端到端）
 │   ├── test_http_security.py  # 30 个安全测试（401/429/healthz/metrics + 子进程端到端）
 │   ├── test_prompt_injection.py # 71 个提示注入防护测试（13 对抗语料 + 7 正常对照 + 服务层 + HTTP 端到端）
-│   ├── test_embedding_cache.py # 8 个缓存键隔离测试（注入假模型，**不需要 BGE**）
+│   ├── test_embedding_cache.py # 9 个缓存键隔离测试（注入假模型，**不需要 BGE**）
 │   ├── test_config.py         # 6 个配置 fail-fast 测试（策略白名单，**不需要 BGE**）
 │   └── test_metrics.py        # 6 个耗时直方图语义测试（**不需要 BGE**）
 └── data/sample/
