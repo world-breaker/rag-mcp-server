@@ -476,7 +476,7 @@ docker run --rm -p 8000:8000 \
 >
 > - **GitHub Actions**（`.github/workflows/ci.yml`）：每次 push / PR 自动跑一遍测试 —— 本文顶部的徽章就是它的真实运行状态；
 > - **Gitee Go**（`.workflow/MasterPipeline.yml`）：**同一批命令、同一套口径**（含同样的 `--deselect` 排除清单），
->   每次 push 到 master 自动构建。Gitee Go 的构建记录在仓库页「流水线」里 —— **需要登录才能看到**，
+>   每次 push 到默认分支自动构建。Gitee Go 的构建记录在仓库页「流水线」里 —— **需要登录才能看到**，
 >   所以这里不挂 Gitee 徽章（匿名访问会被登录墙挡成 404，挂一个坏徽章比不挂更糟）。
 >
 > Gitee Go 那份 YAML 是**照着 GitHub CI 抄的同一批命令**（只有 YAML 方言不同：Gitee Go 用 `step: build@python`，
