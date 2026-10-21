@@ -1,0 +1,41 @@
+# Gitee Go 流水线（社区版：单仓 200 分钟免费构建时长，永久有效）
+#
+# 与 GitHub Actions **并存**：两边跑的是同一批命令、同一套口径、同一批排除项。
+# README 顶部的徽章指向 GitHub；这份是「同一套门禁在 Gitee 上也真跑一遍」。
+#
+# ★ 三个坑（2026-10-21 实测）：
+#   1) Gitee Go 的 YAML **对大小写敏感**，节点名必须与官方文档完全一致
+#      （version / name / displayName / triggers / stages / steps / step / commands …）——
+#      写错**不会在文件里报错**，而是流水线直接不生效；
+#   2) pip 走清华镜像：Gitee 的云端 runner 在国内，默认 PyPI 源很慢；
+#   3) **仓库必须先在网页上开通 Gitee Go**（仓库页 → 流水线 → 开通），
+#      否则这个文件不会被注册成流水线（推了也不会跑）。
+version: '1.0'
+name: ci
+displayName: CI
+
+triggers:
+  trigger: auto
+  push:
+    branches:
+      prefix:
+        - 'master'
+
+stages:
+  - name: stage-test
+    displayName: 单元测试
+    strategy: naturally
+    trigger: auto
+    executor: []
+    steps:
+      - step: build@python
+        name: test_python
+        displayName: 单元测试（离线 · 排除需本机 BGE 模型缓存的 13 个用例）
+        pythonVersion: '3.12'
+        commands:
+          - 'pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple'
+          - 'pip install -r requirements.txt'
+          - 'python -m pytest -q -rs --deselect tests/test_service.py::test_index_stats --deselect tests/test_service.py::test_search_returns_ranked_results --deselect tests/test_service.py::test_top_k_is_capped --deselect tests/test_service.py::test_out_of_domain_query_is_filtered --deselect tests/test_service.py::test_empty_query_rejected --deselect tests/test_service.py::test_result_is_json_serializable --deselect tests/test_service.py::test_concurrent_queries_compute_embedding_once_and_write_cache_atomically --deselect tests/test_service.py::test_concurrent_first_search_builds_index_only_once --deselect tests/test_http_transport.py::test_streamable_http_end_to_end --deselect tests/test_http_security.py::test_http_security_end_to_end --deselect tests/test_prompt_injection.py::test_real_sample_knowledge_base_has_no_false_positive --deselect tests/test_prompt_injection.py::test_service_flags_every_adversarial_document --deselect tests/test_prompt_injection.py::test_prompt_injection_guard_over_real_http'
+        notify: []
+        strategy:
+          retry: '0'
