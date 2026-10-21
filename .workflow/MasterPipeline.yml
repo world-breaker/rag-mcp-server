@@ -1,5 +1,8 @@
 # Gitee Go 流水线（社区版：单仓 200 分钟免费构建时长，永久有效）
 #
+# 文件名用官方模板的约定名 `MasterPipeline.yml`（对应「push 到主干就跑」；
+# 另有 BranchPipeline / PRPipeline 两个约定名，我们不需要 —— 只建一条，避免额度被乘以流水线条数）。
+#
 # 与 GitHub Actions **并存**：两边跑的是同一批命令、同一套口径、同一批排除项。
 # README 顶部的徽章指向 GitHub；这份是「同一套门禁在 Gitee 上也真跑一遍」。
 #
