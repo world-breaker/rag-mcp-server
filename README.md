@@ -14,7 +14,8 @@
 - HTTP 生产化（§5.6）：Bearer 鉴权、令牌桶限流、`/healthz`、Prometheus `/metrics`（零额外依赖）、
   Dockerfile、压测脚本 `scripts/bench_http.py`（本机实测 ~250 QPS / p99 ~113ms，0 错误）
 - 提示注入（间接注入）防护（§7）：检索结果结构化为不可信数据 + 可疑模式标注/中和 + `security` 开关 +
-  `rag_mcp_prompt_injection_findings_total` 指标；13 条对抗语料 + 7 条正常对照全部纳入 `pytest`（零误伤）
+  `rag_mcp_prompt_injection_findings_total` 指标；**20 条对抗语料 + 11 条正常对照 + 2 条长 base64 对照**
+  全部纳入 `pytest`（正常文档零误伤）
 - 与同源项目 [rag-eval-platform](../rag-eval-platform) 的关系：**检索链路同源、最小化移植**（见下文差异表）
 
 ---
@@ -167,9 +168,9 @@ pip install -r requirements.txt
 .venv\Scripts\python.exe -m pytest tests -v
 ```
 
-> 本机实测 **139 passed**：检索行为契约 8（`test_service.py`）＋ 传输 8（`test_http_transport.py`）
+> 本机实测 **173 passed**：检索行为契约 8（`test_service.py`）＋ 传输 8（`test_http_transport.py`）
 > ＋ HTTP 安全 30（`test_http_security.py`，含 1 个子进程端到端用例）
-> ＋ 提示注入防护 71（`test_prompt_injection.py`，含 1 个真实 HTTP 端到端用例）
+> ＋ 提示注入防护 105（`test_prompt_injection.py`，含 1 个真实 HTTP 端到端用例）
 > ＋ 缓存键隔离 9（`test_embedding_cache.py`）＋ 配置 fail-fast 6（`test_config.py`）
 > ＋ 指标直方图语义 7（`test_metrics.py`）。
 > 后三组**不需要真实 BGE 模型**（缓存用例注入假模型、其余是纯函数），因此 CI 离线也能跑。
@@ -263,7 +264,7 @@ HTTP 客户端接入（Cursor / 支持远程 MCP 的客户端）：
 
 **本机实测（2026-10-18）**：`streamable-http` 端到端通过——`initialize` → `tools/list`（2 个工具）→
 `search_knowledge`（LoRA / RAG 命中，领域外问题被阈值过滤）→ `knowledge_base_stats`；
-全量测试 **139 passed**，`stdio` 行为零回归。HTTP 生产化加固见 **§5.6**、容器见 **§5.7**、压测数据见 **§9.4**。
+全量测试 **173 passed**，`stdio` 行为零回归。HTTP 生产化加固见 **§5.6**、容器见 **§5.7**、压测数据见 **§9.4**。
 
 ---
 
@@ -430,14 +431,46 @@ histogram_quantile(0.95, sum(rate(rag_mcp_request_duration_ms_bucket[5m])) by (l
 docker build -t rag-mcp-server:dev .
 ```
 
-> ⚠️ **Dockerfile 未在本机验证**：开发机没装 Docker，`docker build` / `docker run` **一次都没跑过**，
-> `Dockerfile` / `.dockerignore` 是按最佳实践写的「待验证」产物；首次构建可能需要按你所在网络环境微调。
+> ⚠️ **Dockerfile 未在本机验证**：开发机**没有 Docker**（2026-10-21 实测：`docker --version` →
+> `CommandNotFoundException`，`Get-Command docker,podman,nerdctl` 三个都查不到，`C:\Program Files\Docker` 也不存在），
+> 所以 `docker build` / `docker run` **一次都没跑过**，`Dockerfile` / `.dockerignore` 是按最佳实践写的「待验证」产物。
+> **没验证就是没验证**，下面给的是「怎么验 + 预期产物」，不是「已通过」的结论。
+>
 > **「未验证」的边界说清楚**：能静态核对的每一项都已取证、且可重复跑——
 > `.venv\Scripts\python.exe scripts/check_dockerfile_consistency.py`（29 项：CMD 的选项/取值真在 argparse 里、
 > ENV 的 `RAG_MCP_*` 真被 `rag/config.py` 读取、端口在四个地方一致、`/healthz` 真注册且真返回 `index_ready`、
 > 全部第三方 import 都被 requirements 覆盖、COPY 路径存在、`.dockerignore` 没误伤）＋ `hadolint Dockerfile`（0 告警）。
 > **仍未验证**的：build 能否成功、run 能否起服务、`HEALTHCHECK` 真实行为、镜像体积、
 > 非 root 权限是否真的够用、apt/pip/HuggingFace 的网络可达性。别把静态绿灯外推成这些。
+>
+> **想验的话，按这四步跑（每步都给了预期产物，便于判真伪）**：
+>
+> ```bash
+> # ① 构建（预期：退出码 0；镜像 tag rag-mcp-server:dev 出现）
+> docker build -t rag-mcp-server:dev .
+> docker images rag-mcp-server:dev        # 预期：能看到 SIZE，CPU 版 torch 约 1.5–2GB 量级
+>
+> # ② 起容器（预期：容器保持 running，不因 warmup 失败退出；日志出现「预热完成」）
+> #    注意：必须二选一给模型（见下方「模型缓存是容器场景唯一的必答项」）
+> docker run --rm -p 127.0.0.1:8000:8000 \
+>   -v "$HOME/.cache/huggingface:/home/app/.cache/huggingface:ro" \
+>   -e RAG_MCP_AUTH_TOKEN=change-me rag-mcp-server:dev
+>
+> # ③ 冒烟（预期：/healthz 返回 200 且 JSON 里 index_ready=true；/metrics 返回 Prometheus 文本）
+> curl -i http://127.0.0.1:8000/healthz
+> curl -s http://127.0.0.1:8000/metrics | head -5
+> # 未带 token 调 /mcp 预期 401（证明鉴权在容器形态里也生效）
+> curl -i http://127.0.0.1:8000/mcp
+>
+> # ④ 查健康检查与权限（预期：STATUS=healthy；进程用户是 app 而不是 root）
+> docker ps --filter ancestor=rag-mcp-server:dev --format "{{.Status}}"
+> docker inspect rag-mcp-server:dev --format '{{.Config.User}} {{.Config.Healthcheck.Test}}'
+> ```
+>
+> **判真伪的三个易错点**：① 只 build 不 run —— build 成功**不能**证明服务起得来
+> （模型缓存缺失是启动期失败，见下）；② 不看 `docker ps` 的 STATUS —— 容器可能已经退出，
+> `curl` 连不上时先看 `docker logs`；③ 忘了 `/mcp` 免鉴权豁免名单 —— `/healthz`、`/metrics`
+> 是**故意**不鉴权的（k8s 探针要用），但 `/mcp` 必须带 `Authorization: Bearer <token>`。
 
 **模型缓存是容器场景唯一的必答项。** `config.yaml` 默认 `embedding.offline: true`（只读本地缓存），
 而镜像里**没有**模型（`HF_HOME` 只是个空目录），`server.py` 又是**先 `warmup()` 再 `server.run()`**——
@@ -518,11 +551,11 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs \
 
 ```text
 # 本机实测（Windows / Python 3.12.9），三种情形各跑一次：
-# ① 门禁命令 + 本机有 HF 缓存：        126 passed, 13 deselected in 5.36s
-# ② 门禁命令 + HF 缓存清空（= runner）：126 passed, 13 deselected in 3.74s（HF_HOME 指空目录实测）
-# ③ 对照组：不清缓存但**不排除**这 13 个用例 → 3 failed, 126 passed, 10 errors（全是"拉不到模型"）
+# ① 门禁命令 + 本机有 HF 缓存：        160 passed, 13 deselected in 2.18s
+# ② 门禁命令 + HF 缓存清空（= runner）：160 passed, 13 deselected in 2.10s（HF_HOME 指空目录实测）
+# ③ 对照组：不清缓存但**不排除**这 13 个用例 → 3 failed, 160 passed, 10 errors（全是"拉不到模型"）
 #    —— 这样才知道要排除的恰好是 13 个，而不是"随手挑了几个让它变绿"
-# ④ 全量（有缓存、无排除）：139 passed in 89.49s（命令见 §5.3）
+# ④ 全量（有缓存、无排除）：173 passed in 27.76s（命令见 §5.3）
 ```
 
 > 新增的三组用例（缓存键隔离 9 + 配置 fail-fast 6 + 指标直方图 7）**都不需要 BGE 模型**：
@@ -634,12 +667,17 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs \
 | `base64_encoded_instruction` | high | base64 大块**有界解码后再扫一遍**发现的注入（编码只是搬运，不解码就看不见） |
 | `invisible_char` | medium | 零宽 / 双向控制 / Unicode Tag 字符 —— 藏内容与「拆字绕过关键词」都靠它 |
 | `hidden_markup` | medium | HTML 注释、CSS 隐藏样式（`display:none` / `visibility:hidden` / 白字）—— 渲染或阅读时看不见 |
-| `exfil_url` | medium | Markdown/HTML 图片与链接带查询参数或超长不透明段（渲染即可能把上下文拼进 URL 发出去） |
+| `exfil_url` | medium | 外链带查询参数或超长不透明段（渲染即可能把上下文拼进 URL 发出去）。覆盖 **4 种载体**：inline Markdown `![x](url)`、**引用式链接的定义行** `[1]: url`、HTML 外链属性（`src` / `href` / `poster` / `data` / `action`…）、**`srcset` 候选列表**（逐个候选判定） |
 | `overlong_line` | low | 超长单行（默认 > 4000 字符）—— 界面看不到全貌，也能一次塞满上下文 |
-| `base64_blob` | low | base64 大块（去填充后 ≥ 200 字符、且含数字或大小写混排；纯小写长串不误报） |
+| `base64_blob` | low | base64 大块（去填充后 ≥ 200 字符、且含数字或大小写混排；纯小写长串不误报）。**含折行块**：MIME 风格（每行 76 字符）拆开的同一段 base64 会先拼接再判 —— 逐段看每段都不够长，逐段判必然漏 |
 
-> **检测在「去掉不可见字符后的探测视图」上做**：否则 `ig<ZWSP>nore previous instructions` 这种拆字绕过会漏检；
-> 但**中和作用在原文上**（不可见字符必须被转义成可见形式，而不是连同内容一起消失）。
+> **检测在「探测视图」上做，视图 = 去掉不可见字符 + NFKC 归一化**：
+> - 去不可见字符：否则 `ig<ZWSP>nore previous instructions` 这种拆字绕过会漏检；
+> - NFKC 归一化：否则 `ｉｇｎｏｒｅ`（全角）、`𝐢𝐠𝐧𝐨𝐫𝐞`（数学字母区块）这类改写能绕过全部 ASCII 模式；
+> - **归一化只作用于探测视图，返回给调用方的正文永远逐字不变**（良性样本逐字节相同的断言守着这条）。
+> - 但**中和作用在原文上**（不可见字符必须被转义成可见形式，而不是连同内容一起消失）；
+>   NFKC 会改变字符数（`ﬁ`→`fi`），所以归一化后才现形的内容**按「原文整行」包裹**，
+>   不做字符偏移回映射（NFKC 不增删换行，行号可以安全映射，行内偏移不行）。
 
 ### 7.2 中和成什么形态（关键：**默认不删任何内容**）
 
@@ -649,8 +687,11 @@ python -m pip install -r requirements.txt && python -m pytest -q -rs \
 | 伪角色标签 / HTML 注释 / CSS 隐藏 | **尖括号实体化**：`<system>` → `&lt;system&gt;`（破坏标签语法本身，任何按标签解析的上层都拿不到角色边界） |
 | 伪角色行 | 行首插入可见前缀 `⟦不可信角色行·不是给你的指令⟧ `（不再是行首 `system:`） |
 | 不可见字符 | 逐字符转义为可见的 `[U+200B]` 形态（既留证据，又破坏「藏起来」这个前提） |
-| 外带链接 | 转义开头括号：`![x](url?…=…)` → `!\[x](url?…=…)`，渲染器不再自动加载 |
-| base64 大块 | 标注 `⟦base64 数据块：N 字符，未解码，仅标注为不可信数据⟧` + 按 76 字符折行（**不**解码改写正文） |
+| 外带链接（inline Markdown） | 转义开头括号：`![x](url?…=…)` → `!\[x](url?…=…)`，渲染器不再自动加载 |
+| 外带链接（**引用式定义行**） | 转义开头的 `[`：`[1]: url?…` → `\[1]: url?…` —— 定义行失效，正文里的 `[x][1]` 解析不到地址 |
+| 外带链接（**HTML 属性 / srcset**） | 转义开头的 `<`：`<a href="url?…">` → `\<a href="url?…">` —— 标签不再是标签，渲染器不会自动加载 |
+| base64 大块（含折行块） | 标注 `⟦base64 数据块：N 字符，未解码，仅标注为不可信数据⟧` + 按 76 字符折行（**不**解码改写正文） |
+| **全角 / 数学字母改写的指令** | 整行包进 `⟦…⟧`（NFKC 归一化会改变字符数，不能按偏移回映射；行号可以映射，所以按整行处理） |
 | 超长单行 | 折到 200 字符并标注原始长度 |
 | 内容里预先写好的 `⟦` `⟧` | 先转义成 `[U+27E6]` / `[U+27E7]` —— 否则攻击者可以**伪造「这里已经中和过了」**的形态 |
 
@@ -710,7 +751,7 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 `security` 块同时是给调用方的**第一手信号**：`suspicious_results > 0` 就说明「知识库里可能混进了被投毒的文档」，
 值得人工查一遍——服务端也把命中数导出成 `rag_mcp_prompt_injection_findings_total{rule}`（见 §5.6 指标清单）。
 
-### 7.5 对抗测试结果（`tests/test_prompt_injection.py`，13 条对抗语料，本机实测）
+### 7.5 对抗测试结果（`tests/test_prompt_injection.py`，**20 条**对抗语料，本机实测）
 
 | # | 手法 | 期望命中规则 | 实际命中规则（`h`/`m`/`l` = high/medium/low） | 已标记 | 中和变换 | 内容零丢失 |
 |---|---|---|---|---|---|---|
@@ -727,11 +768,24 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 | 11 | 超长单行（5KB 单行，藏内容 + 塞上下文） | `overlong_line` | `overlong_line(l)` | ✅ | 1：`fold_long_line` | ✅ |
 | 12 | base64 大块（内容正常，但已不可人审阅） | `base64_blob` | `base64_blob(l)` | ✅ | 1：`mark_base64_blob` | ✅ |
 | 13 | base64 编码的注入指令（需解码后二次扫描才发现） | `base64_blob`、`base64_encoded_instruction` | `base64_blob(l)`、`base64_encoded_instruction(h)` | ✅ | 1：`mark_base64_blob` | ✅ |
+| 14 | **引用式链接定义行外泄**（URL 藏在文末 `[1]:` 定义行里，正文只写 `[x][1]`） | `exfil_url` | `exfil_url(m)` | ✅ | 1：`neutralize_exfil_ref` | ✅ |
+| 15 | **HTML 链接外泄**（`<a href>` 带查询参数） | `exfil_url` | `exfil_url(m)` | ✅ | 1：`neutralize_exfil_ref` | ✅ |
+| 16 | **HTML 内嵌外泄**（`<iframe src>` 带查询参数） | `exfil_url` | `exfil_url(m)` | ✅ | 1：`neutralize_exfil_ref` | ✅ |
+| 17 | **HTML `srcset` 外泄**（候选列表里混着外带地址） | `exfil_url` | `exfil_url(m)` | ✅ | 1：`neutralize_exfil_ref` | ✅ |
+| 18 | **折行 base64 注入**（MIME 风格 76 字符折行，每段都短于阈值） | `base64_blob`、`base64_encoded_instruction` | `base64_blob(l)`、`base64_encoded_instruction(h)` | ✅ | 1：`mark_base64_blob` | ✅ |
+| 19 | **全角字符改写的指令**（NFKC 归一化后才现形） | `instruction_override` | `instruction_override(h)` | ✅ | 1：`wrap_nfkc_line` | ✅ |
+| 20 | **数学字母 Unicode 区块改写的指令**（NFKC 归一化后才现形） | `instruction_override` | `instruction_override(h)` | ✅ | 1：`wrap_nfkc_line` | ✅ |
 
 「内容零丢失」= 逐字符核对：所有**可见字符**都还在（除了被有意实体化的 `<` `>`），
 所有**不可见字符**都有 `[U+XXXX]` 转义标记（不允许静默删除）。
 
-### 7.6 正常文档零误伤（7 条对照，全部逐字节不变）
+> 第 14–20 条是这一轮补的**缺口回归**：前 13 条是原有语料，14–20 条分别对应
+> 「引用式链接定义行」「`<a href>`」「`<iframe src>`」「`srcset`」「折行 base64」
+> 「全角指令」「数学字母指令」七种**审计确认过的漏检形态**——
+> 每一条都同时补了「检测」与「中和」两侧（`exfil_url` / `base64_blob` / `instruction_override` 三条规则的覆盖面变宽，
+> **规则条数仍是 11 条**，没有新增规则 id）。
+
+### 7.6 正常文档零误伤（**11 条**对照，全部逐字节不变）
 
 | # | 类型 | 命中规则 | 正文 |
 |---|---|---|---|
@@ -742,9 +796,27 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 | 5 | 长行但未超阈值（1500 字符） | （无） | ✅ 一字不动 |
 | 6 | 短 base64 / MD5 令牌（低于大块阈值） | （无） | ✅ 一字不动 |
 | 7 | 正常安全文档（讨论恒定时间比较，无注入意图） | （无） | ✅ 一字不动 |
+| 8 | **正常排版英文段落**（弯引号 / 破折号 / 排版标点） | （无） | ✅ 一字不动 |
+| 9 | **带正常引用式链接的文档**（文末 `[spec]: https://…` 定义行） | （无） | ✅ 一字不动 |
+| 10 | **正常 HTML**（无参数外链 + 相对路径图片） | （无） | ✅ 一字不动 |
+| 11 | **含长 base64 数据块但未达大块阈值**（192 字符 < 200） | （无） | ✅ 一字不动 |
 
-> 上述两张表由一次性脚本读取测试文件里的 `ADVERSARIAL_CASES` / `BENIGN_CASES`，
-> 打印**实际** `scan()` / `sanitize()` 结果生成（不是手写），并与 `pytest` 断言的是同一批语料。
+**另有一组「长 base64、但内容不是指令」的对照（单独成组，见下）**：
+
+| # | 类型 | 命中规则 | 判定 |
+|---|---|---|---|
+| 1 | 长 base64 数据块（单行，内容正常） | `base64_blob(l)` | ✅ 不得报成 `base64_encoded_instruction` |
+| 2 | 折行的长 base64 数据块（内容正常） | `base64_blob(l)` | ✅ 不得报成 `base64_encoded_instruction` |
+
+> **为什么这组不进「零误伤」表**：现有设计里**任何** ≥ `base64_min_chars`（默认 200）的 base64 大块
+> 都会被标成 `base64_blob`（low：「内容正常，但已不可人审阅」）——这与第 12 条对抗样本是**同一条规则、同一口径**。
+> 所以「≥ 阈值的长 base64」不可能同时满足「零命中」。
+> 这一组真正要守住的契约是：**内容不是指令时，不能报成 `base64_encoded_instruction`（high）**——
+> 折行检测引入的新风险正在于此（拼接后解码，若结果被误当成指令，就是凭空造出一条 high 级结论）。
+
+> 上述表格由一次性脚本读取测试文件里的 `ADVERSARIAL_CASES` / `BENIGN_CASES` /
+> `LONG_BASE64_NON_INSTRUCTION_CASES`，打印**实际** `scan()` / `sanitize()` 结果生成（不是手写），
+> 并与 `pytest` 断言的是同一批语料。
 > 除纯函数层外，还有：真实 `KnowledgeService` + 对抗语料的服务层用例、**带 Bearer token 走 `/mcp` 的真实
 > HTTP 端到端用例**（子进程 server + 对抗语料 + `/metrics` 交叉校验）；全部用例**离线可跑、确定性**
 > （不下载模型、不访问外网、不依赖真实 LLM 的判断）。
@@ -762,6 +834,19 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 - **只作用于「返回面」，不改知识库原文**。中和发生在结果离开服务之前；对索引里的原文做中和会改变
   检索语义（向量也会变），那是另一个议题。
 - **不可见字符检测依赖码点集合**：集合之外的新隐形手段（或自造字形）检测不到。
+- **NFKC 归一化只兜得住「有兼容分解」的改写**：全角字母（`ｉｇｎｏｒｅ`）、数学字母区块（`𝐢𝐠𝐧𝐨𝐫𝐞`）、
+  连字（`ﬁ`）、带圈数字（`①`）都会折回 ASCII，检测得到；但**跨文种同形字**（西里尔 `а` 冒充拉丁 `a`、
+  希腊 `ο` 冒充 `o`）**没有兼容分解，NFKC 折不回去**，仍会漏 —— 这类要靠「形似字表 + 上下文」或
+  「把非 ASCII 字母一律当可疑」才能覆盖，本层**刻意没做**（会误伤大量正常的外文资料）。
+- **NFKC 路径按「整行」中和，不做字符级回映射**：归一化会改变字符数（`ﬁ`→`fi`），偏移对不上；
+  所以归一化后才现形的指令被**整行**包进 `⟦…⟧`（行内其他正常内容也一并被标记，属于「宁可多标」）。
+  代价是：跨行的形态（例如**跨行**的 HTML 注释里塞全角指令）在 NFKC 路径上认不出来（行级匹配看不见跨行结构）。
+- **外链检测按「形态」而不是按「域名」判定**：只要带查询参数或超长不透明段就标 `exfil_url`，
+  所以正常文档里带 `?a=b` 的链接也会被标（代价只是一条警告）；反过来说，
+  **不带参数的干净外链**（`https://example.com/x`）一律不标 —— 攻击者用无参数路径外带（`/collect/SECRET`）
+  同样漏（路径里的秘密只要够长且是 base64 字母表字符才会被 `_OPAQUE_TOKEN_RE` 捞到）。
+- **折行 base64 的单行下限是 64 字符**（覆盖 MIME 的 76 与常见的 64）：折得更窄（每行 < 64 字符）
+  的 base64 块**不会被当成折行块**；但它若整体 ≥ 200 字符、且行内无空格，仍可能被「连续段」规则命中。
 - **`include_raw_text: true` 等于放弃这层防护**：它是给调试与对照评测准备的，别在生产开。
 
 ---
@@ -949,7 +1034,7 @@ RAG_MCP_SANITIZE_RETRIEVED=false .venv\Scripts\python.exe server.py
 ### 9.3 单元测试（`python -m pytest tests -v`）—— 历史快照（6 个用例）
 
 > 下面是**项目最初（仅 stdio、6 个用例）**时的原样输出，保留作对照。
-> 当前全量用例已增至 **139 passed**（+ 传输 8 + HTTP 安全 30 + 提示注入防护 71 + 并发 2
+> 当前全量用例已增至 **173 passed**（+ 传输 8 + HTTP 安全 30 + 提示注入防护 105 + 并发 2
 > ＋ 缓存键隔离 9 + 配置 fail-fast 6 + 指标直方图 7），最新数字见 §5.3。
 
 ```text
@@ -1101,7 +1186,8 @@ Failed to read all data for array. Expected (1, 512) = 512 elements, could only 
 | **缓存写入原子化（tmp + `os.replace`）+ 单飞锁 + 读取自愈** | 冷缓存并发下多个请求会同时写同一 `.npy`；并发 bug 是压测暴露的（§9.4），修完才 0 错误 | 半截文件导致随机读取失败、报错难复现（"file seems not fully written"） |
 | **Dockerfile 非 root + `HEALTHCHECK` 打 `/healthz`** | 最小权限运行；健康检查走已内置的只读端点，编排层能自愈 | 以 root 跑容器、又无健康检查，等于放弃容器编排最基本的两道防线 |
 | **注入防护只标注 + 中和，默认不删除内容** | 静默丢内容会让上层拿到**残缺资料却不自知**——那比注入更隐蔽地误导人；转义/包裹既保留证据、又让上层能看到"这里被标记了"。误报的代价因此只是"一条警告" | 默认删除：正常文档里一句"忽略大小写"就可能被削掉，检索结果悄悄失真，且事后无从审计 |
-| **检测在「去不可见字符后的视图」上做，中和作用在原文上** | 拆字绕过（`ig␣nore previous instructions`）只有去掉不可见字符才会现形；而中和若在探测视图上做，藏起来的字符会被连内容一起抹掉 | 直接在原文上匹配 → 拆字绕过必漏；直接在探测视图上中和 → 静默丢字符 |
+| **检测在「去不可见字符 + NFKC 归一化后的视图」上做，中和作用在原文上** | 拆字绕过（`ig␣nore previous instructions`）只有去掉不可见字符才会现形；全角 / 数学字母改写（`ｉｇｎｏｒｅ`、`𝐢𝐠𝐧𝐨𝐫𝐞`）只有 NFKC 归一化才会现形。而中和若在探测视图上做，藏起来的字符会被连内容一起抹掉 | 直接在原文上匹配 → 拆字绕过与全角改写必漏；直接在探测视图上中和 → 静默丢字符 |
+| **NFKC 只作用于探测视图，且归一化后才现形的按「整行」中和** | NFKC 会改变字符数（`ﬁ`→`fi`），归一化后的偏移与原文对不上，按偏移回映射会切错位置；但它不增删换行，行号能安全映射，所以以整行为单位包裹 | 把正文一起 NFKC 化 → 返回内容被改写（良性文档不再逐字节不变）；按字符偏移回映射 → 包错位置、把指令漏在标记外 |
 | **索引 / 向量化时不动原文，只在「返回面」中和** | 对原文做中和会改变向量，检索语义跟着变；"这份资料可不可信"该由**入库流程**（校验/签名/审核）解决，不是查询时偷偷改写 | 查询时改写原文 → 同一文档前后检索结果不一致，索引与返回体对不上，排障时说不清哪份是真的 |
 | **防护默认开启，而不是默认关闭** | 安全的默认值应站在"不被带偏"一侧；上游要旧形态可以显式关（`RAG_MCP_SANITIZE_RETRIEVED=false`） | 默认关闭 → 绝大多数部署永远不会打开（"以后再补"基本等于永远不补） |
 | **把命中数导出成指标 `rag_mcp_prompt_injection_findings_total{rule}`** | 注入命中是**数据面**信号：知识库被投毒时这是第一手证据，比"等上层 Agent 被带偏"早得多 | 只写在返回体里 → 没人聚合、没人告警，投毒文档可以一直躺在库里 |
@@ -1150,7 +1236,7 @@ rag-mcp-server/
 │   ├── test_service.py        # 8 个检索行为契约 + 并发（原子写缓存 / 索引只建一次）测试
 │   ├── test_http_transport.py # 8 个传输测试（参数映射 + Streamable HTTP 端到端）
 │   ├── test_http_security.py  # 30 个安全测试（401/429/healthz/metrics + 子进程端到端）
-│   ├── test_prompt_injection.py # 71 个提示注入防护测试（13 对抗语料 + 7 正常对照 + 服务层 + HTTP 端到端）
+│   ├── test_prompt_injection.py # 105 个提示注入防护测试（20 对抗语料 + 11 正常对照 + 2 长 base64 对照 + 服务层 + HTTP 端到端）
 │   ├── test_embedding_cache.py # 9 个缓存键隔离测试（注入假模型，**不需要 BGE**）
 │   ├── test_config.py         # 6 个配置 fail-fast 测试（策略白名单，**不需要 BGE**）
 │   └── test_metrics.py        # 6 个耗时直方图语义测试（**不需要 BGE**）
@@ -1189,7 +1275,7 @@ rag-mcp-server/
   若暴露公网，请用反向代理把这两个端点限制在内网。
 - **压测数据的可信度**：本机（Windows / CPU 推理）同一配置跨轮 QPS 波动可达 ±30%，§9.4 的表用于看**趋势**，
   不是绝对性能承诺。
-- **Dockerfile 未在本机验证**：开发机无 Docker，镜像**未实际构建运行**（详见 §5.7）。
+- **Dockerfile 未在本机验证**：开发机无 Docker，镜像**未实际构建运行**（详见 §5.7，含「怎么验 + 预期产物」的完整步骤）。
 - **提示注入防护是"抬高成本"，不是"解决"**（详见 §7.7）：11 条规则都是模式匹配，绕过的空间永远存在
   （改写措辞 / 换语言 / 藏在表格、代码块、图片里 / 多轮分段拼接 / 把指令拆到多份文档）。
   它**不能替代上层 Agent 的信任边界与工具权限控制**——真正的兜底是"检索结果永远不能直接触发副作用"。
@@ -1197,6 +1283,8 @@ rag-mcp-server/
 - **防护只作用于返回面，不改知识库原文**：命中片段只做转义/包裹，不做语义改写；对索引原文做中和会改变向量，
   属于入库流程（校验 / 签名 / 审核）该管的事，本项目未实现。
 - **不可见字符检测基于固定码点集合**：集合之外的新隐形手段（或自造字形）检测不到。
+  探测视图另做了 **NFKC 归一化**（全角 / 数学字母 / 连字 / 带圈数字等有兼容分解的改写会被折回 ASCII），
+  但**跨文种同形字**（西里尔 `а` 冒充拉丁 `a`）没有兼容分解，NFKC 折不回去，仍然漏（详见 §7.7）。
   文档若来自不可信来源，建议在**入库前**做文本规范化（NFKC + 剥离不可见字符），本服务不做这件事。
 - **Windows 上客户端中断会打日志**：压测/客户端提前断开时可能出现 `ConnectionResetError` 之类的堆栈噪音，
   来自 uvicorn/asyncio 层，**不影响服务正确性**（后续请求照常），故未特殊屏蔽。

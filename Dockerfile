@@ -1,8 +1,10 @@
 # rag-mcp-server 容器镜像（HTTP 形态）
 #
 # ★★ 未在本机验证 ★★
-#   开发机（Windows）上没有安装 Docker，本文件没有跑过 `docker build` / `docker run`，
-#   是按官方最佳实践写的「待验证」产物。请按下面命令自行验证（README §5.7 有同样说明）：
+#   开发机（Windows）上没有安装 Docker（2026-10-21 实测：docker / podman / nerdctl 三个命令都查不到，
+#   C:\Program Files\Docker 不存在），本文件没有跑过 `docker build` / `docker run`，
+#   是按官方最佳实践写的「待验证」产物。请按下面命令自行验证（README §5.7 有同样说明，
+#   且给出了每一步的**预期产物**与三个易错点）：
 #       docker build -t rag-mcp-server:0.1.0 .
 #       docker run --rm -p 127.0.0.1:8000:8000 -e RAG_MCP_AUTH_TOKEN=change-me rag-mcp-server:0.1.0
 #       curl http://127.0.0.1:8000/healthz

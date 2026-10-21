@@ -15,6 +15,8 @@ indirect prompt injection）——上层模型把检索到的「资料」当成�
    （规则 id / 严重级别 / 命中片段 / 命中次数）；同时把命中片段转义/包裹到
    「不会被当成指令执行」的形态（详见 `sanitize()` 的逐条变换）。
    **默认不删除任何内容**：静默丢内容会让上层拿到残缺资料却不自知——那比注入更隐蔽地误导人。
+   检测跑在**探测视图**上（= 去掉不可见字符 + NFKC 归一化），中和跑在**原文**上：
+   拆字绕过与全角/数学字母改写只有归一化后才会现形，而返回值永远逐字不变。
 3. **可配置**：`security.sanitize_retrieved`（默认 `true`）；关掉后退化为「原文直出」，
    只保留 `trust` 标记，方便已有调用方平滑迁移。
 
@@ -36,6 +38,7 @@ from __future__ import annotations
 import base64
 import binascii
 import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -178,9 +181,29 @@ _CSS_HIDDEN_RE = re.compile(
 )
 #: Markdown 链接 / 图片（含 `![alt](url)` 与 `[text](url)`）
 _MD_REF_RE = re.compile(r"!?\[(?P<text>[^\]\n]{0,120})\]\((?P<url>[^)\s]{1,300})\)")
-#: HTML 图片（`<img src="...">`）
-_HTML_IMG_RE = re.compile(
-    r"<\s*img\b[^<>]{0,300}?src\s*=\s*[\"']?(?P<url>[^\"'\s>]{1,300})", re.IGNORECASE
+#: Markdown **引用式链接的定义行**（`[1]: https://example.com/x`）——外链地址真正的藏身处：
+#: 正文里只写 `[x][1]`，URL 放在文末的定义行里。inline 正则看不见它，
+#: 所以「检测」与「中和」都必须单独覆盖这一行。
+_MD_REF_DEF_RE = re.compile(
+    r"^(?P<indent>[ \t]{0,3})\[(?P<label>[^\]\n]{1,120})\]:[ \t]*"
+    r"(?P<url><[^<>\n]{1,300}>|[^\s<>\n]{1,300})",
+    re.MULTILINE,
+)
+#: HTML 元素上的**外链属性**：`src` / `href` / `poster` / `data` / `action` ……
+#: `<img src>` / `<a href>` / `<iframe src>` / `<video poster>` 都是「渲染即自动加载」的外泄载体，
+#: 所以检测面必须覆盖**属性**而不是只认 `<img>` 这一个标签。
+_HTML_URL_ATTR_RE = re.compile(
+    r"<\s*[a-zA-Z][a-zA-Z0-9-]{0,20}\b[^<>]{0,300}?"
+    r"\b(?P<attr>src|href|poster|data|action|formaction|background|codebase|manifest|"
+    r"profile|longdesc|ping|cite)\s*=\s*[\"']?(?P<url>[^\"'<>\s]{1,300})",
+    re.IGNORECASE,
+)
+#: `srcset` 的取值范围和其它属性不同：它是**逗号分隔的候选列表**
+#: （`a.png 1x, https://evil.example/x?d=1 2x`），可能含空格，必须整体取出再按逗号切分。
+_HTML_SRCSET_RE = re.compile(
+    r"<\s*[a-zA-Z][a-zA-Z0-9-]{0,20}\b[^<>]{0,300}?"
+    r"\b(?P<attr>srcset)\s*=\s*[\"']?(?P<url>[^\"'<>]{1,600})",
+    re.IGNORECASE,
 )
 #: 超长不透明段（把数据编码进 URL 路径的常见形态）
 _OPAQUE_TOKEN_RE = re.compile(r"[A-Za-z0-9+/_\-]{64,}")
@@ -197,6 +220,16 @@ _TEXT_PATTERNS_COMPILED: Tuple[Tuple[str, re.Pattern], ...] = tuple(
 _RULE_META: Dict[str, Tuple[str, str]] = {
     rule: (severity, detail) for rule, severity, detail, _patterns in _TEXT_RULES
 }
+
+#: 「NFKC 归一化后才现形」时需要补充中和的模式集合：
+#: 文本规则（指令覆盖 / 伪造工具调用 / ReAct）＋ 伪角色行 / 伪角色标签。
+#: 为什么不含外链类模式：外链的语义来自「渲染器会自动加载它」，
+#: 全角 URL 在渲染器眼里根本不是 URL（不会自动加载），所以按整行包裹并不影响它的危害面；
+#: 这属于**刻意放过的边界**（见 README §7.7）。
+_NFKC_SENSITIVE_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = tuple(
+    [(rule, pattern) for rule, pattern in _TEXT_PATTERNS_COMPILED]
+    + [("fake_role_line", _ROLE_LINE_RE), ("fake_role_tag", _ROLE_TAG_RE)]
+)
 
 
 @dataclass
@@ -279,11 +312,54 @@ def _strip_invisible(text: str) -> str:
     return "".join(ch for ch in text if not is_invisible_char(ch))
 
 
+def _nfkc(text: str) -> str:
+    """探测用视图：NFKC 归一化。**只用于匹配，不改正文。**
+
+    为什么需要：规则表里的模式都是 ASCII 字面量，攻击者把指令改写成
+    全角字符（`ｉｇｎｏｒｅ`）、数学字母 Unicode 区块（`𝐢𝐠𝐧𝐨𝐫𝐞`）
+    或同形异码字，就能在肉眼下「看着像英文」的同时绕开全部 ASCII 模式。
+    NFKC 把它们折叠回 ASCII，规则表才认得出来。
+
+    边界（重要）：NFKC **不增删换行**（已对全部码点验证过），所以行号可以
+    安全地映射回原文；它**会改变字符数**（`ﬁ`→`fi`、`①`→`1`），所以
+    **不能**按字符偏移把归一化后的命中位置映射回原文 —— 只能按整行处理。
+    """
+    if not text:
+        return text
+    # 额外把 U+FF00（全角空格）折成普通空格：NFKC **不**折叠它（它没有兼容分解），
+    # 而它既是中文排版里的常见空格、也是攻击者分隔全角词的手法。
+    return unicodedata.normalize("NFKC", text).replace("\uff00", " ")
+
+
 def _looks_like_exfil(url: str) -> bool:
     """URL 是否具备「数据外带」形态：带参数的查询串，或超长不透明段。"""
     if "?" in url and "=" in url.split("?", 1)[1]:
         return True
     return bool(_OPAQUE_TOKEN_RE.search(url))
+
+
+def _ref_url_candidates(match: "re.Match") -> List[str]:
+    """从一条引用（Markdown / HTML）里取出「待判定的 URL 候选」。
+
+    为什么 `srcset` 要特殊处理：它的值是**逗号分隔的候选列表**
+    （`a.png 1x, https://evil.example/x?d=1 2x`）。整串一起判会把
+    「一个正常图片 + 一个可疑候选」混成一谈；逐个判才能既不漏、也不误伤。
+    """
+    attr = (match.groupdict().get("attr") or "").lower()
+    url = match.group("url")
+    if attr == "srcset":
+        candidates: List[str] = []
+        for part in url.split(","):
+            tokens = part.split()
+            if tokens:
+                candidates.append(tokens[0])  # 去掉 `2x` / `100w` 这类尺寸描述符
+        return candidates
+    return [url]
+
+
+def _match_has_exfil(match: "re.Match") -> bool:
+    """一条引用里是否藏着「数据外带」形态的 URL（检测与中和共用，避免判定漂移）。"""
+    return any(_looks_like_exfil(candidate) for candidate in _ref_url_candidates(match))
 
 
 def _looks_like_base64_blob(run: str, min_chars: int) -> bool:
@@ -305,21 +381,90 @@ def _looks_like_base64_blob(run: str, min_chars: int) -> bool:
     )
 
 
-def _base64_matches(text: str, min_chars: int):
-    """按位置产出疑似 base64 大块的匹配对象（检测与中和共用，避免判定漂移）。"""
+#: 「折行 base64」里**单行**的长度下限。MIME 风格（RFC 2045）按 76 字符折行，
+#: 常见实现也有按 64 折的 —— 取 64 以覆盖这两种宽度。
+#: 为什么不能更低：折行判定是「把连续几行拼起来」，下限太低会把普通散文行
+#: （例如整行只有一个长单词的行）也拼进来，凭空制造误报。
+_BASE64_LINE_MIN_CHARS = 64
+#: 整行都是 base64 字符（`=` 只允许出现在末尾作为填充）
+_BASE64_LINE_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
+
+
+def _is_base64_line(line: str) -> bool:
+    """这一行是不是「折行 base64 的一段」（整行都是 base64 字符，且长度够）。"""
+    stripped = line.strip()
+    if len(stripped) < _BASE64_LINE_MIN_CHARS:
+        return False
+    return _BASE64_LINE_RE.fullmatch(stripped) is not None
+
+
+def _folded_base64_spans(text: str, min_chars: int) -> List[Tuple[int, int, str]]:
+    """折行 base64 块：连续若干行、每行都是 base64 字符，**拼起来再判**。
+
+    为什么必须拼：MIME 风格（RFC 2045）每行 76 字符，拆出来的每一段都远短于
+    `base64_min_chars`（默认 200）—— 逐段看必然漏，拼接后才是那个「大块」。
+    """
+    lines = text.split("\n")
+    offsets: List[int] = []
+    cursor = 0
+    for line in lines:
+        offsets.append(cursor)
+        cursor += len(line) + 1
+
+    spans: List[Tuple[int, int, str]] = []
+    index = 0
+    total = len(lines)
+    while index < total:
+        if not _is_base64_line(lines[index]):
+            index += 1
+            continue
+        last = index
+        while last + 1 < total and _is_base64_line(lines[last + 1]):
+            last += 1
+        blob = "".join(lines[i].strip() for i in range(index, last + 1))
+        # 至少两行才算「折行」；单行的大块交给下面的连续段判定（避免同一块被算两次）
+        if last > index and _looks_like_base64_blob(blob, min_chars):
+            spans.append((offsets[index], offsets[last] + len(lines[last]), blob))
+            index = last + 1
+        else:
+            index += 1
+    return spans
+
+
+def _base64_spans(text: str, min_chars: int) -> List[Tuple[int, int, str]]:
+    """产出疑似 base64 大块的 (起点, 终点, 片段)（**检测与中和共用**，避免判定漂移）。
+
+    覆盖两种形态：
+    1. **连续段**：一段不跨行的 base64（`样本数据：AAAA…`）；
+    2. **折行块**：MIME 风格拆成多行的同一段 base64（拼接后再判，见上）。
+    """
     if min_chars <= 0:
-        return
+        return []
+    spans: List[Tuple[int, int, str]] = []
+    covered: List[Tuple[int, int]] = []
+
+    # (1) 折行块
+    for start, end, blob in _folded_base64_spans(text, min_chars):
+        spans.append((start, end, blob))
+        covered.append((start, end))
+
+    # (2) 连续段（跳过已被折行块覆盖的部分，避免同一块被算两次）
     pattern = re.compile(
         rf"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/=]{{{min_chars},}}(?![A-Za-z0-9+/=])"
     )
     for match in pattern.finditer(text):
+        if any(match.start() >= start and match.end() <= end for start, end in covered):
+            continue
         if _looks_like_base64_blob(match.group(0), min_chars):
-            yield match
+            spans.append((match.start(), match.end(), match.group(0)))
+
+    spans.sort(key=lambda item: item[0])
+    return spans
 
 
 def _base64_blobs(text: str, min_chars: int) -> List[str]:
     """疑似 base64 大块列表（检测用）。"""
-    return [m.group(0) for m in _base64_matches(text, min_chars)]
+    return [blob for _start, _end, blob in _base64_spans(text, min_chars)]
 
 
 def _try_decode_base64(blob: str) -> Optional[str]:
@@ -391,21 +536,67 @@ def _sub_prefix_role_line(pattern: re.Pattern, text: str, prefix: str) -> Tuple[
 
 
 def _neutralize_refs(text: str) -> Tuple[str, int]:
-    """中和「可自动加载」的远程引用：转义开头的 `[`，使 Markdown/HTML 不再渲染成资源。"""
+    """中和「可自动加载」的远程引用：转义开头（Markdown 的 `[` / HTML 的 `<`），
+    使 Markdown / HTML 不再渲染成资源。
+
+    覆盖四种形态（与检测面一一对应）：
+    - inline Markdown `![alt](url)` / `[text](url)`；
+    - **引用式链接的定义行** `[1]: https://…`（URL 真正藏身的地方）；
+    - HTML 的外链属性 `<img src>` / `<a href>` / `<iframe src>` / `<video poster>` …；
+    - HTML 的 `srcset`（逗号分隔的候选列表，逐个判定）。
+    """
     count = 0
 
     def repl(match: re.Match) -> str:
         nonlocal count
-        if not _looks_like_exfil(match.group("url")):
+        if not _match_has_exfil(match):
             return match.group(0)
         count += 1
         body = match.group(0)
         escaped = "!\\" + body[1:] if body.startswith("!") else "\\" + body
         return f"{MARK_OPEN}{escaped}{MARK_CLOSE}"
 
+    def repl_def(match: re.Match) -> str:
+        """引用式链接的定义行：转义开头的 `[`（**缩进要原样保留**，不能去转义空白）。"""
+        nonlocal count
+        if not _match_has_exfil(match):
+            return match.group(0)
+        count += 1
+        indent = match.group("indent")
+        body = match.group(0)[len(indent):]
+        return f"{indent}{MARK_OPEN}\\{body}{MARK_CLOSE}"
+
     out = _MD_REF_RE.sub(repl, text)
-    out = _HTML_IMG_RE.sub(repl, out)
+    out = _MD_REF_DEF_RE.sub(repl_def, out)
+    out = _HTML_URL_ATTR_RE.sub(repl, out)
+    out = _HTML_SRCSET_RE.sub(repl, out)
     return out, count
+
+
+def _neutralize_nfkc_only(text: str) -> Tuple[str, int]:
+    """补充中和：**只在 NFKC 归一化之后才匹配上**的内容（全角 / 数学字母 / 同形异码字改写的指令）。
+
+    为什么按**整行**包裹、而不是按字符偏移回映射：NFKC 会改变字符串长度
+    （`ﬁ`→`fi`、`①`→`1`、全角字母→ASCII），归一化后的偏移与原文**不是一一对应**，
+    按偏移回映射会切错位置（把无关字符包进去，甚至把指令本身漏在标记之外）。
+    但 NFKC **不增删换行**，所以行号能安全地映射回原文 —— 以「原文整行」为单位处理。
+
+    为什么只在「归一化后匹配、原文不匹配」时才动手：原文能匹配的，已经被前面的
+    常规中和步骤处理过（片段被包裹后该模式不再匹配），再来一次会变成重复包裹。
+    """
+    hits = 0
+    out: List[str] = []
+    for line in text.split("\n"):
+        norm = _nfkc(line)
+        if norm != line and any(
+            pattern.search(norm) and not pattern.search(line)
+            for _rule, pattern in _NFKC_SENSITIVE_PATTERNS
+        ):
+            out.append(f"{MARK_OPEN}{line}{MARK_CLOSE}")
+            hits += 1
+        else:
+            out.append(line)
+    return "\n".join(out), hits
 
 
 def _neutralize_base64(text: str, min_chars: int) -> Tuple[str, int]:
@@ -414,8 +605,11 @@ def _neutralize_base64(text: str, min_chars: int) -> Tuple[str, int]:
     为什么**不**在这里解码后改写正文：解码结果同样不可信，把它塞进正文等于把
     「不可读的载荷」翻译成「可读的载荷」，收益为零、风险更高；解码只用于**检测**
     （见 `PromptGuard._scan_text`），检测结论以规则形式给出。
+
+    判定与检测**共用** `_base64_spans`（含「折行块拼接后再判」），避免出现
+    「检测说有大块、中和却找不到它」的漂移。
     """
-    blobs = list(_base64_matches(text, min_chars))
+    blobs = _base64_spans(text, min_chars)
     if not blobs:
         return text, 0
 
@@ -430,10 +624,10 @@ def _neutralize_base64(text: str, min_chars: int) -> Tuple[str, int]:
     # 按位置切片重建（不能用 str.replace：折行后的替换文本里仍含原片段，会自我嵌套）
     pieces: List[str] = []
     cursor = 0
-    for match in blobs:
-        pieces.append(text[cursor : match.start()])
-        pieces.append(make_replacement(match.group(0)))
-        cursor = match.end()
+    for start, end, blob in blobs:
+        pieces.append(text[cursor:start])
+        pieces.append(make_replacement(blob))
+        cursor = end
     pieces.append(text[cursor:])
     return "".join(pieces), len(blobs)
 
@@ -496,13 +690,16 @@ class PromptGuard:
         allow_base64: bool,
         invisible_source: Optional[str] = None,
     ) -> List[Finding]:
-        """在（已去掉不可见字符的）文本上跑全部规则。
+        """在（已去掉不可见字符、并做过 NFKC 归一化的）文本上跑全部规则。
 
         `allow_base64=False` 用于 base64 递归解码后的二次扫描：只递归一层，
         避免「编码里套编码」把检测拖成无限递归。
         `invisible_source` 是**原始文本**：不可见字符必须在去掉它们之前统计，
         否则「隐藏字符」这类命中会因为探测视图已被清洗而永远为空。
+
+        NFKC 归一化只发生在这个**探测视图**上（返回值永远是原文，不受影响）。
         """
+        probe = _nfkc(probe)
         findings: List[Finding] = []
 
         # 同一规则下多条正则可能命中同一片段（例如「忽略以上所有指令」被两条模式同时覆盖），
@@ -559,16 +756,12 @@ class PromptGuard:
                 )
             )
 
-        refs = [
-            m.group("url")
-            for m in _MD_REF_RE.finditer(probe)
-            if _looks_like_exfil(m.group("url"))
-        ]
-        refs += [
-            m.group("url")
-            for m in _HTML_IMG_RE.finditer(probe)
-            if _looks_like_exfil(m.group("url"))
-        ]
+        # 外泄 URL：四种形态统一判定（判定函数与中和面共用，见 `_match_has_exfil`）
+        refs: List[str] = []
+        for pattern in (_MD_REF_RE, _MD_REF_DEF_RE, _HTML_URL_ATTR_RE, _HTML_SRCSET_RE):
+            for match in pattern.finditer(probe):
+                if _match_has_exfil(match):
+                    refs.append(match.group("url"))
         if refs:
             findings.append(
                 Finding(
@@ -724,13 +917,19 @@ class PromptGuard:
         if hits:
             transformations.append("neutralize_exfil_ref")
 
-        # (7) base64 大块 → 标注 + MIME 折行
+        # (7) base64 大块 → 标注 + MIME 折行（含折行块：拼接后再判，与检测共用判定函数）
         if allow_base64 and self.base64_min_chars > 0:
             work, hits = _neutralize_base64(work, self.base64_min_chars)
             if hits:
                 transformations.append("mark_base64_blob")
 
-        # (8) 超长单行 → 折行
+        # (8) NFKC 归一化后才现形的内容（全角 / 数学字母 / 同形异码字改写的指令）
+        #     → 按「原文整行」包裹（归一化会改变字符数，不能按字符偏移回映射）
+        work, hits = _neutralize_nfkc_only(work)
+        if hits:
+            transformations.append("wrap_nfkc_line")
+
+        # (9) 超长单行 → 折行
         work, hits = _fold_long_lines(work, self.max_line_chars, self.line_wrap_width)
         if hits:
             transformations.append("fold_long_line")
